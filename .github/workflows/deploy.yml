@@ -1,0 +1,44 @@
+name: Deploy Backend to Aliyun
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy Backend
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          echo "=== 开始部署后端 ==="
+          
+          scp -o StrictHostKeyChecking=no -r * ${SERVER_USER}@${SERVER_HOST}:/root/backend/
+          
+          ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} << 'EOF'
+            set -e
+            cd /root/backend
+            docker build -t cyber-diary-backend .
+            docker rm -f backend-server || true
+            docker run -d --name backend-server --restart unless-stopped -p 8000:8000 \
+              -v /root/backend/diary.db:/app/diary.db \
+              --env-file /root/backend/.env \
+              cyber-diary-backend
+            sleep 3
+            curl -s http://localhost:8000/health || echo "服务可能尚未完全启动"
+            docker ps --filter name=backend-server
+          EOF
+          
+          echo "=== 后端部署完成 ==="
