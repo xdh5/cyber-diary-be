@@ -111,6 +111,10 @@ class TokenResponse(BaseModel):
     password_required: Optional[bool] = False
 
 
+class GoogleVerifyRequest(BaseModel):
+    credential: str  # id_token from Google (browser-side)
+
+
 class SendCodeRequest(BaseModel):
     email: EmailStr
 

@@ -21,7 +21,7 @@ from app.core.config import settings
 from app.crud.crud import create_user, get_user_by_email, update_user
 from app.db.session import get_db
 from app.models.models import User
-from app.schemas.schemas import RegisterRequest, SendCodeRequest, SetPasswordRequest, TokenResponse, UpdateProfileRequest, UserResponse
+from app.schemas.schemas import GoogleVerifyRequest, RegisterRequest, SendCodeRequest, SetPasswordRequest, TokenResponse, UpdateProfileRequest, UserResponse
 
 router = APIRouter()
 
@@ -86,17 +86,46 @@ def google_authorize():
     return {"url": f"https://accounts.google.com/o/oauth2/v2/auth?{query}"}
 
 
-@router.get("/google/callback", response_model=TokenResponse)
-def google_callback(code: str, db: Session = Depends(get_db)):
-    token_data = request_google_token(code)
-    google_info = fetch_google_user_info(token_data["access_token"])
+@router.post("/google/verify", response_model=TokenResponse)
+def google_verify(payload: GoogleVerifyRequest, db: Session = Depends(get_db)):
+    """
+    浏览器直接从 Google 拿到 id_token，发给后端本地验证。
+    避免服务器在国内无法访问 Google API 的问题。
+    """
+    from jose import jwt as jose_jwt
+    from datetime import datetime, timezone
+
+    try:
+        claims = jose_jwt.get_unverified_claims(payload.credential)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid credential format")
+
+    iss = claims.get("iss", "")
+    if iss not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(status_code=400, detail="Invalid token issuer")
+
+    if claims.get("aud") != settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=400, detail="Invalid token audience")
+
+    if claims.get("exp", 0) < datetime.now(timezone.utc).timestamp():
+        raise HTTPException(status_code=400, detail="Token expired")
+
+    google_info = {
+        "id": claims.get("sub"),
+        "email": claims.get("email"),
+        "name": claims.get("name"),
+        "picture": claims.get("picture"),
+    }
+    if not google_info["id"] or not google_info["email"]:
+        raise HTTPException(status_code=400, detail="Missing required Google user info")
+
     user = get_or_create_google_user(db, google_info)
     access_token = create_access_token({"sub": user.email})
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "password_required": user.hashed_password is None,
-    }
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        password_required=user.hashed_password is None,
+    )
 
 
 @router.post("/set-password", response_model=dict)
