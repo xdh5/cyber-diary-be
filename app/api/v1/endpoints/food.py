@@ -225,6 +225,7 @@ async def upload_food_photo(
     files: list[UploadFile] = File(default=[]),
     caption: str | None = Form(default=None),
     comment: str | None = Form(default=None),
+    shot_date: str | None = Form(default=None),
     x_track_id: str | None = Header(default=None, alias="X-Track-Id"),
     x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
     db: Session = Depends(get_db),
@@ -316,7 +317,13 @@ async def upload_food_photo(
                 food_name_candidates.append(classification.food_name)
 
             shot_at = _extract_shot_at(payload) or now_shanghai()
-            shot_date = diary_date_for_datetime(shot_at)
+            if shot_date:
+                try:
+                    from datetime import date as _date
+                    shot_at = datetime.combine(_date.fromisoformat(shot_date), shot_at.time())
+                except ValueError:
+                    pass
+            shot_date_val = diary_date_for_datetime(shot_at)
             cloudinary_url = _cloudinary_upload(
                 payload,
                 user_id=current_user.id,
@@ -331,7 +338,7 @@ async def upload_food_photo(
                     group_id=photo_group_id,
                     photo_url=cloudinary_url,
                     caption=None,
-                    shot_date=shot_date,
+                    shot_date=shot_date_val,
                     shot_at=shot_at,
                     created_at=now_shanghai(),
                     updated_at=now_shanghai(),
@@ -352,7 +359,7 @@ async def upload_food_photo(
                 )
             )
             db.commit()
-            _upsert_food_photo_section(db, current_user.id, shot_date, food_photo)
+            _upsert_food_photo_section(db, current_user.id, shot_date_val, food_photo)
             continue
 
         summary = classification.summary or caption_text[:15] or "美食记录"
