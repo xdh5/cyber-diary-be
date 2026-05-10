@@ -31,7 +31,10 @@ jobs:
             set -e
             cd /root/backend
             docker build -t cyber-diary-backend .
-            docker rm -f backend-server || true
+            if docker ps -a --format '{{.Names}}' | grep -q '^backend-server$'; then
+              docker stop backend-server
+              docker rm -f backend-server
+            fi
             docker run -d --name backend-server --restart unless-stopped -p 8000:8000 \
               -v /root/backend/diary.db:/app/diary.db \
               --env-file /root/backend/.env \

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import text
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -17,11 +16,9 @@ from app.api.chat import router as chat_router
 from app.api.chat import run_daily_chat_summary_job
 from app.api.v1.api import api_router
 from app.core.auth import get_password_hash, pick_default_avatar
-from app.core.content import extract_first_image_url, normalize_entry_content
 from app.core.config import settings
 from app.db.session import engine, get_db
-from app.core.timezone import diary_date_for_datetime, now_shanghai
-from app.models.models import EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, User
+from app.models.models import Entry, User
 from app.crud.crud import create_user
 
 LOG_LEVEL = settings.LOG_LEVEL
@@ -105,120 +102,6 @@ scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 
 def ensure_database_schema(engine):
     SQLModel.metadata.create_all(engine)
-
-    if settings.DATABASE_URL.startswith("sqlite"):
-        with engine.begin() as conn:
-            columns = conn.execute(text("PRAGMA table_info(entries)")).fetchall()
-            column_names = {col[1] for col in columns}
-            if "date" not in column_names:
-                conn.execute(text("ALTER TABLE entries ADD COLUMN date DATE"))
-                conn.execute(
-                    text(
-                        "UPDATE entries "
-                        "SET date = COALESCE(substr(created_at, 1, 10), date('now', 'localtime')) "
-                        "WHERE date IS NULL"
-                    )
-                )
-            if "content_format" not in column_names:
-                conn.execute(text("ALTER TABLE entries ADD COLUMN content_format VARCHAR(20) DEFAULT 'markdown'"))
-                conn.execute(
-                    text(
-                        "UPDATE entries "
-                        "SET content_format = 'markdown' "
-                        "WHERE content_format IS NULL OR trim(content_format) = ''"
-                    )
-                )
-            if "content_legacy" not in column_names:
-                conn.execute(text("ALTER TABLE entries ADD COLUMN content_legacy TEXT"))
-
-            user_columns = conn.execute(text("PRAGMA table_info(users)")).fetchall()
-            user_column_names = {col[1] for col in user_columns}
-            if "agent_name" not in user_column_names:
-                conn.execute(text("ALTER TABLE users ADD COLUMN agent_name VARCHAR(100) DEFAULT 'Agent'"))
-                conn.execute(text("UPDATE users SET agent_name = 'Agent' WHERE agent_name IS NULL OR trim(agent_name) = ''"))
-            if "agent_system_prompt" not in user_column_names:
-                conn.execute(text("ALTER TABLE users ADD COLUMN agent_system_prompt TEXT"))
-
-            food_columns = conn.execute(text("PRAGMA table_info(food_photos)")).fetchall()
-            food_column_names = {col[1] for col in food_columns}
-            if "shot_at" not in food_column_names:
-                conn.execute(text("ALTER TABLE food_photos ADD COLUMN shot_at DATETIME"))
-            if "group_id" not in food_column_names:
-                conn.execute(text("ALTER TABLE food_photos ADD COLUMN group_id VARCHAR(64)"))
-
-            # Migrate food_photo_comments table structure
-            comment_columns = conn.execute(text("PRAGMA table_info(food_photo_comments)")).fetchall()
-            comment_column_names = {col[1] for col in comment_columns}
-            
-            if "food_photo_id" in comment_column_names and "group_id" not in comment_column_names:
-                # Need to migrate table structure
-                conn.execute(text("ALTER TABLE food_photo_comments ADD COLUMN group_id VARCHAR(64)"))
-                conn.execute(text("ALTER TABLE food_photo_comments ADD COLUMN user_id INTEGER"))
-                
-                # Migrate data: find group_id from food_photos
-                conn.execute(
-                    text("""
-                        UPDATE food_photo_comments
-                        SET group_id = COALESCE(
-                            (SELECT group_id FROM food_photos WHERE food_photos.id = food_photo_comments.food_photo_id),
-                            'group-' || food_photo_comments.id
-                        )
-                        WHERE group_id IS NULL
-                    """)
-                )
-                conn.execute(text("UPDATE food_photo_comments SET user_id = 0 WHERE user_id IS NULL"))
-
-
-def migrate_food_photo_captions_to_comments(session: Session):
-    """Migrate food photo captions to comments (for new group-based comment structure)"""
-    if settings.DATABASE_URL.startswith("sqlite"):
-        # Check if table has been migrated to new structure
-        with session.begin():
-            try:
-                # Try to query one comment to check if group_id column exists
-                session.exec(select(FoodPhotoComment).limit(1)).first()
-                # If we get here, table exists with new structure
-            except Exception as e:
-                logger.warning(f"Could not query food photo comments, skipping migration: {e}")
-                return
-    
-    try:
-        photos = session.exec(select(FoodPhoto).where(FoodPhoto.caption.is_not(None))).all()
-        changed = False
-
-        for photo in photos:
-            caption = (photo.caption or "").strip()
-            if not caption or not photo.group_id:
-                continue
-
-            # Check if this comment already exists
-            existing = session.exec(
-                select(FoodPhotoComment).where(
-                    (FoodPhotoComment.group_id == photo.group_id) &
-                    (FoodPhotoComment.content == caption)
-                )
-            ).first()
-            
-            if not existing:
-                session.add(
-                    FoodPhotoComment(
-                        group_id=photo.group_id,
-                        user_id=photo.user_id,
-                        content=caption,
-                        created_at=photo.created_at,
-                    )
-                )
-                changed = True
-
-            photo.caption = None
-            session.add(photo)
-            changed = True
-
-        if changed:
-            session.commit()
-    except Exception as e:
-        logger.warning(f"Error during migration: {e}")
-        session.rollback()
 
 
 def seed_data(session: Session):
@@ -337,97 +220,6 @@ def seed_data(session: Session):
     session.commit()
 
 
-def migrate_entry_content_to_rich_text(session: Session):
-    entries = session.exec(select(Entry)).all()
-
-    migrated_count = 0
-    for entry in entries:
-        original_content = entry.content or ""
-        normalized_content = normalize_entry_content(original_content)
-        current_format = (entry.content_format or "").strip().lower()
-
-        needs_format_update = current_format != "html"
-        needs_content_update = original_content != normalized_content
-
-        if not needs_format_update and not needs_content_update:
-            continue
-
-        if needs_content_update and not entry.content_legacy:
-            entry.content_legacy = original_content
-
-        entry.content = normalized_content
-        entry.content_format = "html"
-
-        if not entry.photo_url:
-            first_image_url = extract_first_image_url(normalized_content)
-            if first_image_url:
-                entry.photo_url = first_image_url
-
-        entry.updated_at = now_shanghai()
-        session.add(entry)
-        migrated_count += 1
-
-    if migrated_count > 0:
-        session.commit()
-        logger.info("entry content migration finished: migrated=%s", migrated_count)
-
-
-def cleanup_duplicate_comments(session: Session):
-    """Clean up duplicate comments in database"""
-    try:
-        # Get all comments grouped by group_id and content
-        comments = session.exec(select(FoodPhotoComment)).all()
-        
-        seen = {}  # (group_id, content) -> comment_id
-        duplicates = []
-        
-        for comment in comments:
-            key = (comment.group_id, comment.content.strip())
-            if key in seen:
-                # Mark as duplicate
-                duplicates.append(comment.id)
-            else:
-                seen[key] = comment.id
-        
-        # Delete duplicates
-        if duplicates:
-            for comment in session.exec(select(FoodPhotoComment)).all():
-                if comment.id in duplicates:
-                    session.delete(comment)
-            session.commit()
-            logger.info(f"cleanup_duplicate_comments: removed {len(duplicates)} duplicates")
-    except Exception as e:
-        logger.warning(f"Error cleaning up duplicate comments: {e}")
-        session.rollback()
-
-
-def migrate_diary_day_boundary_dates(session: Session):
-    entry_count = 0
-    for entry in session.exec(select(Entry)).all():
-        expected_date = diary_date_for_datetime(entry.created_at)
-        if entry.date != expected_date:
-            entry.date = expected_date
-            session.add(entry)
-            entry_count += 1
-
-    photo_count = 0
-    for photo in session.exec(select(FoodPhoto)).all():
-        base_dt = photo.shot_at or photo.created_at
-        expected_shot_date = diary_date_for_datetime(base_dt)
-        if photo.shot_date != expected_shot_date:
-            photo.shot_date = expected_shot_date
-            session.add(photo)
-            photo_count += 1
-
-    if entry_count or photo_count:
-        session.commit()
-        logger.info(
-            "diary day-boundary migration finished: entries=%s photos=%s",
-            entry_count,
-            photo_count,
-        )
-
-
 @app.get("/", response_model=dict)
 def read_root():
     return {"message": "Welcome to Cyber Diary API"}
@@ -468,7 +260,3 @@ ensure_database_schema(engine)
 
 with Session(engine) as session:
     seed_data(session)
-    migrate_food_photo_captions_to_comments(session)
-    cleanup_duplicate_comments(session)
-    migrate_entry_content_to_rich_text(session)
-    migrate_diary_day_boundary_dates(session)
