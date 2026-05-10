@@ -26,17 +26,18 @@ jobs:
           echo "=== 开始部署后端 ==="
           
           scp -o StrictHostKeyChecking=no -r * ${SERVER_USER}@${SERVER_HOST}:/root/backend/
-          
+
           ssh -o StrictHostKeyChecking=no ${SERVER_USER}@${SERVER_HOST} << 'EOF'
             set -e
             cd /root/backend
+            mkdir -p /root/backend/data
             docker build -t cyber-diary-backend .
             if docker ps -a --format '{{.Names}}' | grep -q '^backend-server$'; then
               docker stop backend-server
               docker rm -f backend-server
             fi
             docker run -d --name backend-server --restart unless-stopped -p 8000:8000 \
-              -v /root/backend/diary.db:/app/diary.db \
+              -v /root/backend/data:/app/data \
               --env-file /root/backend/.env \
               cyber-diary-backend
             sleep 3
