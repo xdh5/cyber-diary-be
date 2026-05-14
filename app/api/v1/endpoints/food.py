@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date as DateType, datetime
 from io import BytesIO
@@ -8,33 +9,24 @@ from uuid import uuid4
 
 import cloudinary
 import cloudinary.uploader
+import cv2
 import exifread
+import numpy as np
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlmodel import Session
 
 from app.api.v1.endpoints.upload import ALLOWED_IMAGE_TYPES, MAX_IMAGE_SIZE
 from app.core.auth import get_current_user
 from app.core.config import settings
-from app.core.diary import (
-    build_food_info_block,
-    build_food_info_section,
-    build_food_section,
-    merge_food_info_section,
-    merge_food_section,
-)
-from app.core.food_ai import FoodClassification, classify_food_upload, compose_food_comment
-from app.core.timezone import diary_date_for_datetime, diary_today_shanghai, now_shanghai
+from app.core.timezone import diary_date_for_datetime, now_shanghai
 from app.crud.crud import (
-    create_entry,
     create_food_photo,
-    get_entry_by_user_date_and_mood,
     get_food_photos_by_user,
-    update_entry,
     get_food_photo_comments,
     create_food_photo_comment,
 )
 from app.db.session import get_db
-from app.models.models import Entry, FoodPhoto, FoodPhotoComment, UploadAsset
+from app.models.models import FoodPhoto, FoodPhotoComment, UploadAsset
 from app.schemas.schemas import FoodBatchProcessResponse, FoodPhotoDayResponse, FoodPhotoGroupResponse, FoodPhotoResponse, FoodPhotoCommentResponse, FoodPhotoCommentCreate
 
 
@@ -56,6 +48,169 @@ def _extract_shot_at(payload: bytes) -> Optional[datetime]:
         return datetime.strptime(raw_text, "%Y:%m:%d %H:%M:%S")
     except Exception:
         return None
+
+
+def _estimate_image_sharpness(image: np.ndarray) -> float:
+    """
+    评估图片清晰度：计算 Laplacian 方差
+    返回值范围: 0-1000+
+    - 50 以下：非常模糊
+    - 50-150：中等模糊
+    - 150+ : 清晰
+    """
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        return float(laplacian.var())
+    except Exception:
+        return 200.0  # 默认假设清晰
+
+
+def _enhance_food_photo(payload: bytes) -> bytes:
+    """
+    食品特化修图：CLAHE + 白平衡 + 饱和度增强 + 自适应锐化
+    处理逆光、暗光、黄光等常见食物拍照场景
+    """
+    try:
+        # 解码图片
+        nparr = np.frombuffer(payload, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            return payload
+        
+        # 1. 自适应直方图均衡 (CLAHE) - 处理暗光和逆光
+        image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(image_lab)
+        
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        
+        image_lab = cv2.merge([l, a, b])
+        image = cv2.cvtColor(image_lab, cv2.COLOR_LAB2BGR)
+        
+        # 2. 白平衡调整 (灰度世界假设) - 修正色温
+        image_float = image.astype(np.float32) / 255.0
+        b_avg = np.mean(image_float[:, :, 0])
+        g_avg = np.mean(image_float[:, :, 1])
+        r_avg = np.mean(image_float[:, :, 2])
+        
+        color_avg = (b_avg + g_avg + r_avg) / 3.0
+        
+        # 只在色温差异明显时调整（避免过度处理）
+        if color_avg > 0:
+            image_float[:, :, 0] = np.clip(image_float[:, :, 0] * color_avg / (b_avg + 1e-6), 0, 1)
+            image_float[:, :, 1] = np.clip(image_float[:, :, 1] * color_avg / (g_avg + 1e-6), 0, 1)
+            image_float[:, :, 2] = np.clip(image_float[:, :, 2] * color_avg / (r_avg + 1e-6), 0, 1)
+        
+        image = (image_float * 255).astype(np.uint8)
+        
+        # 3. HSV 空间饱和度增强 - 食物看起来更诱人
+        image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+        h, s, v = cv2.split(image_hsv)
+        
+        # 饱和度提升 12%，但要限制在有效范围内
+        s = np.clip(s * 1.12, 0, 255)
+        
+        image_hsv = cv2.merge([h, s, v]).astype(np.uint8)
+        image = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2BGR)
+        
+        # 4. 自适应锐化 (Unsharp Mask) - 根据清晰度自动调整强度
+        sharpness = _estimate_image_sharpness(image)
+        
+        if sharpness < 80:  # 非常模糊
+            strength = 0.6
+        elif sharpness < 150:  # 中等模糊
+            strength = 0.4
+        elif sharpness < 300:  # 略微模糊
+            strength = 0.2
+        else:  # 清晰
+            strength = 0.1
+        
+        gaussian = cv2.GaussianBlur(image, (0, 0), 0.8)
+        image = cv2.addWeighted(image, 1.0 + strength, gaussian, -strength, 0)
+        image = np.clip(image, 0, 255).astype(np.uint8)
+        
+        # 编码为 JPEG
+        success, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if success:
+            return encoded.tobytes()
+        else:
+            logger.warning("food_photo_enhancement_encode_failed")
+            return payload
+            
+    except Exception as e:
+        # 修图失败则返回原图，不影响上传
+        logger.warning("food_photo_enhancement_failed error=%s", str(e)[:100])
+        return payload
+
+
+async def _enhance_and_replace_food_photo(
+    food_photo_id: int,
+    original_payload: bytes,
+    user_id: int,
+    shot_at: datetime,
+    file_name: str,
+    track_id: str,
+):
+    """
+    后台异步修图并替换 Cloudinary URL
+    失败时保持原图，不影响用户
+    """
+    try:
+        enhanced_payload = _enhance_food_photo(original_payload)
+        
+        enhanced_url = _cloudinary_upload(
+            enhanced_payload,
+            user_id=user_id,
+            shot_at=shot_at,
+            file_name=file_name,
+        )
+        
+        # 使用临时会话更新数据库
+        from app.db.session import SessionLocal
+        db = SessionLocal()
+        try:
+            food_photo = db.query(FoodPhoto).filter(FoodPhoto.id == food_photo_id).first()
+            if food_photo:
+                food_photo.photo_url = enhanced_url
+                food_photo.updated_at = now_shanghai()
+                db.commit()
+                logger.info(
+                    "food_photo_enhancement_replaced track_id=%s photo_id=%s",
+                    track_id,
+                    food_photo_id,
+                )
+        finally:
+            db.close()
+            
+    except Exception as e:
+        logger.warning(
+            "food_photo_enhancement_async_failed track_id=%s photo_id=%s error=%s",
+            track_id,
+            food_photo_id,
+            str(e)[:100],
+        )
+
+
+def _schedule_food_photo_enhancement(
+    food_photo_id: int,
+    original_payload: bytes,
+    user_id: int,
+    shot_at: datetime,
+    file_name: str,
+    track_id: str,
+):
+    """在线程中运行后台修图任务"""
+    import threading
+    thread = threading.Thread(
+        target=lambda: asyncio.run(
+            _enhance_and_replace_food_photo(
+                food_photo_id, original_payload, user_id, shot_at, file_name, track_id
+            )
+        ),
+        daemon=True,
+    )
+    thread.start()
 
 
 def _cloudinary_upload(payload: bytes, *, user_id: int, shot_at: datetime, file_name: str) -> str:
@@ -85,64 +240,6 @@ def _cloudinary_upload(payload: bytes, *, user_id: int, shot_at: datetime, file_
             detail="Cloudinary response missing secure_url",
         )
     return secure_url
-
-
-def _ensure_food_entry_section(
-    db: Session,
-    current_user_id: int,
-    target_date: DateType,
-    summary: str,
-    user_text: str,
-) -> Entry:
-    existing = get_entry_by_user_date_and_mood(db, current_user_id, target_date, "AI汇总")
-    block = build_food_info_block(
-        summary=summary,
-        user_text=user_text,
-        timestamp=now_shanghai(),
-    )
-
-    if existing is None:
-        existing = Entry(
-            title=f"{target_date.isoformat()} 聊天回顾",
-            content=build_food_info_section([block]),
-            date=target_date,
-            district="数字分身",
-            mood="AI汇总",
-            user_id=current_user_id,
-            created_at=now_shanghai(),
-            updated_at=now_shanghai(),
-        )
-        return create_entry(db, existing)
-
-    existing.content = merge_food_info_section(existing.content or "", block)
-    existing.updated_at = now_shanghai()
-    return update_entry(db, existing)
-
-
-def _upsert_food_photo_section(db: Session, current_user_id: int, shot_date: DateType, photo: FoodPhoto) -> Entry:
-    existing = get_entry_by_user_date_and_mood(db, current_user_id, shot_date, "AI汇总")
-    if existing is None:
-        existing = Entry(
-            title=f"{shot_date.isoformat()} 聊天回顾",
-            content="",
-            date=shot_date,
-            district="数字分身",
-            photo_url=photo.photo_url,
-            mood="AI汇总",
-            user_id=current_user_id,
-            created_at=now_shanghai(),
-            updated_at=now_shanghai(),
-        )
-        existing = create_entry(db, existing)
-    else:
-        existing.photo_url = photo.photo_url
-
-    food_photos = get_food_photos_by_user(db, current_user_id)
-    matching_photos = [item for item in food_photos if item.shot_date == shot_date]
-    food_section = build_food_section(matching_photos)
-    existing.content = merge_food_section(existing.content or "", food_section)
-    existing.updated_at = now_shanghai()
-    return update_entry(db, existing)
 
 
 def _validated_food_files(files: list[UploadFile]) -> tuple[list[tuple[UploadFile, bytes, str]], list[str]]:
@@ -256,181 +353,104 @@ async def upload_food_photo(
             len(caption_text),
         )
 
-    if not validated_files and not caption_text:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="file or caption is required")
-
     if not validated_files:
-        summary = caption_text[:15] or "美食记录"
-        entry = _ensure_food_entry_section(
-            db,
-            current_user.id,
-            diary_today_shanghai(),
-            summary=summary,
-            user_text=caption_text,
-        )
-        logger.info(
-            "food_upload_persisted track_id=%s user_id=%s branch=INFO info_count=1",
-            track_id,
-            current_user.id,
-        )
-        return FoodBatchProcessResponse(
-            type="INFO",
-            summary=summary,
-            photos=[],
-            track_id=track_id,
-            entry_id=entry.id,
-            date=entry.date,
-            processed_count=0,
-            photo_count=0,
-            info_count=1,
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files is required")
 
     created_photos: list[FoodPhoto] = []
-    info_count = 0
-    info_summaries: list[str] = []
-    food_name_candidates: list[str] = []
     photo_group_id = track_id
+
+    # Parse shot_date parameter
+    parsed_shot_date: Optional[DateType] = None
+    if shot_date:
+        try:
+            parsed_shot_date = DateType.fromisoformat(shot_date)
+        except ValueError:
+            logger.warning("food_upload_invalid_shot_date track_id=%s user_id=%s shot_date=%s", track_id, current_user.id, shot_date)
 
     for index, (file_obj, payload, content_type) in enumerate(validated_files, start=1):
         item_track_id = f"{track_id}:{index}"
-        classification: FoodClassification = classify_food_upload(
-            image_bytes=payload,
-            content_type=content_type,
-            caption=caption_text or None,
-            file_name=file_obj.filename,
+        
+        # Extract shot time from EXIF
+        shot_at = _extract_shot_at(payload) or now_shanghai()
+        
+        # Determine shot_date: use parameter if provided, otherwise derive from shot_at
+        if parsed_shot_date:
+            # Replace date part with provided shot_date, keep time part from EXIF
+            shot_at = datetime.combine(parsed_shot_date, shot_at.time())
+            shot_date_val = parsed_shot_date
+        else:
+            shot_date_val = diary_date_for_datetime(shot_at)
+
+        # 先上传原始图到 Cloudinary（快速），立即返回给前端
+        cloudinary_url = _cloudinary_upload(
+            payload,
+            user_id=current_user.id,
+            shot_at=shot_at,
+            file_name=file_obj.filename or "food-image",
+        )
+
+        food_photo = create_food_photo(
+            db,
+            FoodPhoto(
+                user_id=current_user.id,
+                group_id=photo_group_id,
+                photo_url=cloudinary_url,
+                caption=caption_text or None,
+                shot_date=shot_date_val,
+                shot_at=shot_at,
+                created_at=now_shanghai(),
+                updated_at=now_shanghai(),
+            ),
+        )
+        created_photos.append(food_photo)
+
+        db.add(
+            UploadAsset(
+                user_id=current_user.id,
+                kind="food-image",
+                original_name=file_obj.filename or "food-image",
+                content_type=file_obj.content_type or "image/jpeg",
+                size_bytes=len(payload),
+                storage_path=cloudinary_url,
+                public_url=cloudinary_url,
+                created_at=now_shanghai(),
+            )
+        )
+        db.commit()
+
+        # 后台异步修图并替换（不阻塞响应）
+        _schedule_food_photo_enhancement(
+            food_photo.id,
+            payload,
+            current_user.id,
+            shot_at,
+            file_obj.filename or "food-image",
+            track_id,
         )
 
         logger.info(
-            "food_upload_item_classified track_id=%s user_id=%s index=%s filename=%s type=%s summary=%s food_name=%s raw=%s",
+            "food_upload_item_persisted track_id=%s user_id=%s index=%s filename=%s shot_date=%s",
             item_track_id,
             current_user.id,
             index,
             file_obj.filename or "<unnamed>",
-            classification.type,
-            (classification.summary or "")[:80],
-            (classification.food_name or "")[:80],
-            (classification.raw_text or "")[:180],
+            shot_date_val.isoformat(),
         )
 
-        if classification.type == "FOOD_PHOTO":
-            if classification.food_name:
-                food_name_candidates.append(classification.food_name)
-
-            shot_at = _extract_shot_at(payload) or now_shanghai()
-            if shot_date:
-                try:
-                    from datetime import date as _date
-                    shot_at = datetime.combine(_date.fromisoformat(shot_date), shot_at.time())
-                except ValueError:
-                    pass
-            shot_date_val = diary_date_for_datetime(shot_at)
-            cloudinary_url = _cloudinary_upload(
-                payload,
-                user_id=current_user.id,
-                shot_at=shot_at,
-                file_name=file_obj.filename or "food-image",
-            )
-
-            food_photo = create_food_photo(
-                db,
-                FoodPhoto(
-                    user_id=current_user.id,
-                    group_id=photo_group_id,
-                    photo_url=cloudinary_url,
-                    caption=None,
-                    shot_date=shot_date_val,
-                    shot_at=shot_at,
-                    created_at=now_shanghai(),
-                    updated_at=now_shanghai(),
-                ),
-            )
-            created_photos.append(food_photo)
-
-            db.add(
-                UploadAsset(
-                    user_id=current_user.id,
-                    kind="food-image",
-                    original_name=file_obj.filename or "food-image",
-                    content_type=file_obj.content_type or "image/jpeg",
-                    size_bytes=len(payload),
-                    storage_path=cloudinary_url,
-                    public_url=cloudinary_url,
-                    created_at=now_shanghai(),
-                )
-            )
-            db.commit()
-            _upsert_food_photo_section(db, current_user.id, shot_date_val, food_photo)
-            continue
-
-        summary = classification.summary or caption_text[:15] or "美食记录"
-        entry = _ensure_food_entry_section(
-            db,
-            current_user.id,
-            diary_today_shanghai(),
-            summary=summary,
-            user_text=caption_text,
-        )
-        info_count += 1
-        info_summaries.append(summary)
-        logger.info(
-            "food_upload_item_persisted track_id=%s user_id=%s index=%s branch=INFO entry_id=%s",
-            item_track_id,
-            current_user.id,
-            index,
-            entry.id,
-        )
-
-    if created_photos:
-        final_comment = compose_food_comment(
-            raw_comment=caption_text or None,
-            info_summaries=info_summaries,
-            food_name=food_name_candidates[0] if food_name_candidates else None,
-        )
-        if final_comment:
-            create_food_photo_comment(
-                db,
-                FoodPhotoComment(
-                    group_id=photo_group_id,
-                    user_id=current_user.id,
-                    content=final_comment,
-                    created_at=now_shanghai(),
-                ),
-            )
-
-        logger.info(
-            "food_upload_persisted track_id=%s user_id=%s branch=FOOD_PHOTO photo_count=%s info_count=%s comment_len=%s",
-            track_id,
-            current_user.id,
-            len(created_photos),
-            info_count,
-            len(final_comment),
-        )
-        return FoodBatchProcessResponse(
-            type="FOOD_PHOTO",
-            food_name=food_name_candidates[0] if food_name_candidates else None,
-            summary="；".join(info_summaries[:3]) or None,
-            track_id=track_id,
-            photos=created_photos,
-            processed_count=len(validated_files),
-            photo_count=len(created_photos),
-            info_count=info_count,
-        )
-
-    summary = "；".join(info_summaries[:3]) or caption_text[:15] or "美食记录"
     logger.info(
-        "food_upload_persisted track_id=%s user_id=%s branch=INFO info_count=%s",
+        "food_upload_completed track_id=%s user_id=%s photo_count=%s",
         track_id,
         current_user.id,
-        info_count,
+        len(created_photos),
     )
+
     return FoodBatchProcessResponse(
-        type="INFO",
-        summary=summary,
-        photos=[],
+        type="FOOD_PHOTO",
         track_id=track_id,
+        photos=created_photos,
         processed_count=len(validated_files),
-        photo_count=0,
-        info_count=info_count,
+        photo_count=len(created_photos),
+        info_count=0,
     )
 
 
@@ -465,7 +485,7 @@ def clean_duplicate_comments(
     current_user=Depends(get_current_user),
 ):
     """清理重复的美食照片评论（仅供管理员使用）"""
-    from sqlmodel import func
+    from sqlmodel import func, select
     
     # 查询重复的评论组
     duplicate_groups = db.exec(
