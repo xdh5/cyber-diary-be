@@ -3,6 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip setuptools wheel -i https://mirrors.aliyun.com/pypi/simple/
 RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 COPY . .
