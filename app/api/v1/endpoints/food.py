@@ -68,8 +68,8 @@ def _estimate_image_sharpness(image: np.ndarray) -> float:
 
 def _enhance_food_photo(payload: bytes) -> bytes:
     """
-    食品特化修图：CLAHE + 白平衡 + 饱和度增强 + 自适应锐化
-    处理逆光、暗光、黄光等常见食物拍照场景
+    食品特化修图：CLAHE + 白平衡 + 色温矫正 + 饱和度增强 + 自适应锐化
+    处理逆光、暗光、黄光、蓝光等常见食物拍照场景
     """
     try:
         # 解码图片
@@ -78,12 +78,16 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         if image is None:
             return payload
         
-        # 1. 自适应直方图均衡 (CLAHE) - 处理暗光和逆光
+        # 1. 自适应直方图均衡 (CLAHE) - 强力处理暗光和逆光
         image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(image_lab)
         
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        # clipLimit 从 2.5 提高到 3.8，更强的提亮效果
+        clahe = cv2.createCLAHE(clipLimit=3.8, tileGridSize=(8, 8))
         l = clahe.apply(l)
+        
+        # 在 LAB 空间直接增加 L 值 (+15)，确保整体不会太暗
+        l = np.clip(l.astype(np.float32) + 15, 0, 255).astype(np.uint8)
         
         image_lab = cv2.merge([l, a, b])
         image = cv2.cvtColor(image_lab, cv2.COLOR_LAB2BGR)
@@ -96,25 +100,29 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         
         color_avg = (b_avg + g_avg + r_avg) / 3.0
         
-        # 只在色温差异明显时调整（避免过度处理）
+        # 白平衡调整
         if color_avg > 0:
             image_float[:, :, 0] = np.clip(image_float[:, :, 0] * color_avg / (b_avg + 1e-6), 0, 1)
             image_float[:, :, 1] = np.clip(image_float[:, :, 1] * color_avg / (g_avg + 1e-6), 0, 1)
             image_float[:, :, 2] = np.clip(image_float[:, :, 2] * color_avg / (r_avg + 1e-6), 0, 1)
         
+        # 3. 色温矫正 - 压低蓝通道，增加红/绿，消除蓝色偏差
+        image_float[:, :, 0] = image_float[:, :, 0] * 0.92  # B 通道降低 8%
+        image_float[:, :, 2] = np.clip(image_float[:, :, 2] * 1.06, 0, 1)  # R 通道提升 6%
+        
         image = (image_float * 255).astype(np.uint8)
         
-        # 3. HSV 空间饱和度增强 - 食物看起来更诱人
+        # 4. HSV 空间饱和度增强 - 食物看起来更诱人
         image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
         h, s, v = cv2.split(image_hsv)
         
-        # 饱和度提升 12%，但要限制在有效范围内
-        s = np.clip(s * 1.12, 0, 255)
+        # 饱和度提升 20%（从 1.12 提高到 1.20）
+        s = np.clip(s * 1.20, 0, 255)
         
         image_hsv = cv2.merge([h, s, v]).astype(np.uint8)
         image = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2BGR)
         
-        # 4. 自适应锐化 (Unsharp Mask) - 根据清晰度自动调整强度
+        # 5. 自适应锐化 (Unsharp Mask) - 根据清晰度自动调整强度
         sharpness = _estimate_image_sharpness(image)
         
         if sharpness < 80:  # 非常模糊
