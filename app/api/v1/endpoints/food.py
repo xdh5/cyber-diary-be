@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import logging
+import threading
 from datetime import date as DateType, datetime
 from io import BytesIO
 from typing import Optional
@@ -25,7 +25,7 @@ from app.crud.crud import (
     get_food_photo_comments,
     create_food_photo_comment,
 )
-from app.db.session import get_db
+from app.db.session import engine, get_db
 from app.models.models import FoodPhoto, FoodPhotoComment, UploadAsset
 from app.schemas.schemas import FoodBatchProcessResponse, FoodPhotoDayResponse, FoodPhotoGroupResponse, FoodPhotoResponse, FoodPhotoCommentResponse, FoodPhotoCommentCreate
 
@@ -144,7 +144,7 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         return payload
 
 
-async def _enhance_and_replace_food_photo(
+def _enhance_and_replace_food_photo(
     food_photo_id: int,
     original_payload: bytes,
     user_id: int,
@@ -158,19 +158,18 @@ async def _enhance_and_replace_food_photo(
     """
     try:
         enhanced_payload = _enhance_food_photo(original_payload)
-        
+
         enhanced_url = _cloudinary_upload(
             enhanced_payload,
             user_id=user_id,
             shot_at=shot_at,
             file_name=file_name,
         )
-        
-        # 使用临时会话更新数据库
-        from app.db.session import SessionLocal
-        db = SessionLocal()
+
+        # 使用独立会话更新数据库
+        db = Session(engine)
         try:
-            food_photo = db.query(FoodPhoto).filter(FoodPhoto.id == food_photo_id).first()
+            food_photo = db.get(FoodPhoto, food_photo_id)
             if food_photo:
                 food_photo.photo_url = enhanced_url
                 food_photo.updated_at = now_shanghai()
@@ -182,7 +181,7 @@ async def _enhance_and_replace_food_photo(
                 )
         finally:
             db.close()
-            
+
     except Exception as e:
         logger.warning(
             "food_photo_enhancement_async_failed track_id=%s photo_id=%s error=%s",
@@ -201,13 +200,9 @@ def _schedule_food_photo_enhancement(
     track_id: str,
 ):
     """在线程中运行后台修图任务"""
-    import threading
     thread = threading.Thread(
-        target=lambda: asyncio.run(
-            _enhance_and_replace_food_photo(
-                food_photo_id, original_payload, user_id, shot_at, file_name, track_id
-            )
-        ),
+        target=_enhance_and_replace_food_photo,
+        args=(food_photo_id, original_payload, user_id, shot_at, file_name, track_id),
         daemon=True,
     )
     thread.start()
