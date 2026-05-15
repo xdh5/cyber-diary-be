@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date as DateType, datetime
 from io import BytesIO
 from typing import Optional
@@ -9,9 +8,7 @@ from uuid import uuid4
 
 import cloudinary
 import cloudinary.uploader
-import cv2
 import exifread
-import numpy as np
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlmodel import Session
 
@@ -33,8 +30,7 @@ from app.schemas.schemas import FoodBatchProcessResponse, FoodPhotoDayResponse, 
 router = APIRouter()
 logger = logging.getLogger("cyber_diary.food")
 
-# 线程池：最多 3 个并发修图任务（防止内存爆炸）
-_enhancement_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="food-enhance-")
+# Image enhancement moved to client-side (browser). Server no longer performs OpenCV/Numpy processing.
 
 
 def _extract_shot_at(payload: bytes) -> Optional[datetime]:
@@ -51,202 +47,7 @@ def _extract_shot_at(payload: bytes) -> Optional[datetime]:
         return datetime.strptime(raw_text, "%Y:%m:%d %H:%M:%S")
     except Exception:
         return None
-
-
-def _estimate_image_sharpness(image: np.ndarray) -> float:
-    """
-    评估图片清晰度：计算 Laplacian 方差
-    返回值范围: 0-1000+
-    - 50 以下：非常模糊
-    - 50-150：中等模糊
-    - 150+ : 清晰
-    """
-    try:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        return float(laplacian.var())
-    except Exception:
-        return 200.0  # 默认假设清晰
-
-
-def _enhance_food_photo(payload: bytes) -> bytes:
-    """
-    食品特化修图：CLAHE + 白平衡 + 色温矫正 + 饱和度增强 + 自适应锐化
-    处理逆光、暗光、黄光、蓝光等常见食物拍照场景
-    """
-    nparr = None
-    image = None
-    image_lab = None
-    image_hsv = None
-    gaussian = None
-    try:
-        # 解码图片
-        nparr = np.frombuffer(payload, np.uint8)
-        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if image is None:
-            return payload
-        
-        # 1. 自适应直方图均衡 (CLAHE) - 强力处理暗光和逆光
-        image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(image_lab)
-        
-        # clipLimit 从 2.5 提高到 3.8，更强的提亮效果
-        clahe = cv2.createCLAHE(clipLimit=3.8, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        del clahe  # 显式释放 CLAHE 对象
-        
-        # 在 LAB 空间直接增加 L 值 (+15)，确保整体不会太暗
-        l = np.clip(l.astype(np.float32) + 15, 0, 255).astype(np.uint8)
-        
-        image_lab = cv2.merge([l, a, b])
-        image = cv2.cvtColor(image_lab, cv2.COLOR_LAB2BGR)
-        del l, a, b, image_lab  # 释放 LAB 通道
-        image_lab = None
-        
-        # 2. 白平衡调整 (灰度世界假设) - 修正色温
-        image_float = image.astype(np.float32) / 255.0
-        b_avg = np.mean(image_float[:, :, 0])
-        g_avg = np.mean(image_float[:, :, 1])
-        r_avg = np.mean(image_float[:, :, 2])
-        
-        color_avg = (b_avg + g_avg + r_avg) / 3.0
-        
-        # 白平衡调整
-        if color_avg > 0:
-            image_float[:, :, 0] = np.clip(image_float[:, :, 0] * color_avg / (b_avg + 1e-6), 0, 1)
-            image_float[:, :, 1] = np.clip(image_float[:, :, 1] * color_avg / (g_avg + 1e-6), 0, 1)
-            image_float[:, :, 2] = np.clip(image_float[:, :, 2] * color_avg / (r_avg + 1e-6), 0, 1)
-        
-        # 3. 色温矫正 - 压低蓝通道，增加红/绿，消除蓝色偏差
-        image_float[:, :, 0] = image_float[:, :, 0] * 0.92  # B 通道降低 8%
-        image_float[:, :, 2] = np.clip(image_float[:, :, 2] * 1.06, 0, 1)  # R 通道提升 6%
-        
-        image = (image_float * 255).astype(np.uint8)
-        del image_float  # 释放浮点数组
-        
-        # 4. HSV 空间饱和度增强 - 食物看起来更诱人
-        image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
-        h, s, v = cv2.split(image_hsv)
-        
-        # 饱和度提升 20%（从 1.12 提高到 1.20）
-        s = np.clip(s * 1.20, 0, 255)
-        
-        image_hsv = cv2.merge([h, s, v]).astype(np.uint8)
-        image = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2BGR)
-        del h, s, v, image_hsv  # 释放 HSV 通道
-        image_hsv = None
-        
-        # 5. 自适应锐化 (Unsharp Mask) - 根据清晰度自动调整强度
-        sharpness = _estimate_image_sharpness(image)
-        
-        if sharpness < 80:  # 非常模糊
-            strength = 0.6
-        elif sharpness < 150:  # 中等模糊
-            strength = 0.4
-        elif sharpness < 300:  # 略微模糊
-            strength = 0.2
-        else:  # 清晰
-            strength = 0.1
-        
-        gaussian = cv2.GaussianBlur(image, (0, 0), 0.8)
-        image = cv2.addWeighted(image, 1.0 + strength, gaussian, -strength, 0)
-        image = np.clip(image, 0, 255).astype(np.uint8)
-        del gaussian  # 释放高斯模糊结果
-        gaussian = None
-        
-        # 编码为 JPEG
-        success, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if success:
-            return encoded.tobytes()
-        else:
-            logger.warning("food_photo_enhancement_encode_failed")
-            return payload
-            
-    except Exception as e:
-        # 修图失败则返回原图，不影响上传
-        logger.warning("food_photo_enhancement_failed error=%s", str(e)[:100])
-        return payload
-    finally:
-        # 显式释放所有 NumPy 数组和 OpenCV 对象
-        del nparr, image, image_lab, image_hsv, gaussian
-
-
-def _enhance_and_replace_food_photo(
-    food_photo_id: int,
-    original_payload: bytes,
-    user_id: int,
-    shot_at: datetime,
-    file_name: str,
-    track_id: str,
-):
-    """
-    后台异步修图并替换 Cloudinary URL
-    失败时保持原图，不影响用户
-    """
-    db = None
-    try:
-        enhanced_payload = _enhance_food_photo(original_payload)
-        del original_payload  # 立即释放原始图片字节数据
-
-        enhanced_url = _cloudinary_upload(
-            enhanced_payload,
-            user_id=user_id,
-            shot_at=shot_at,
-            file_name=file_name,
-        )
-        del enhanced_payload  # 释放增强后的图片字节数据
-
-        # 使用独立会话更新数据库
-        db = Session(engine)
-        try:
-            food_photo = db.get(FoodPhoto, food_photo_id)
-            if food_photo:
-                food_photo.photo_url = enhanced_url
-                food_photo.updated_at = now_shanghai()
-                db.commit()
-                logger.info(
-                    "food_photo_enhancement_replaced track_id=%s photo_id=%s",
-                    track_id,
-                    food_photo_id,
-                )
-        finally:
-            db.close()
-            db = None
-
-    except Exception as e:
-        logger.warning(
-            "food_photo_enhancement_async_failed track_id=%s photo_id=%s error=%s",
-            track_id,
-            food_photo_id,
-            str(e)[:100],
-        )
-    finally:
-        # 确保数据库连接被关闭
-        if db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
-
-
-def _schedule_food_photo_enhancement(
-    food_photo_id: int,
-    original_payload: bytes,
-    user_id: int,
-    shot_at: datetime,
-    file_name: str,
-    track_id: str,
-):
-    """在线程池中运行后台修图任务（限制并发数，防止内存爆炸）"""
-    _enhancement_executor.submit(
-        _enhance_and_replace_food_photo,
-        food_photo_id,
-        original_payload,
-        user_id,
-        shot_at,
-        file_name,
-        track_id,
-    )
+# Image enhancement moved to client-side; server no longer performs OpenCV/Numpy processing.
 
 
 def _cloudinary_upload(payload: bytes, *, user_id: int, shot_at: datetime, file_name: str) -> str:
@@ -460,18 +261,12 @@ async def upload_food_photo(
         )
         db.commit()
 
-        # 后台异步修图并替换（不阻塞响应）
-        _schedule_food_photo_enhancement(
-            food_photo.id,
-            payload,
-            current_user.id,
-            shot_at,
-            file_obj.filename or "food-image",
-            track_id,
-        )
-        
-        # 释放本地的 payload 引用（后台线程已经持有了它）
-        del payload
+        # Image enhancement moved to client-side; server will not process images.
+        # 释放本地的 payload 引用
+        try:
+            del payload
+        except Exception:
+            pass
 
         logger.info(
             "food_upload_item_persisted track_id=%s user_id=%s index=%s filename=%s shot_date=%s",
@@ -522,6 +317,67 @@ def add_photo_comment(
         created_at=now_shanghai(),
     )
     return create_food_photo_comment(db, comment)
+
+
+@router.delete("/groups/{group_id}")
+def delete_food_group(
+    group_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """删除整个照片群组（包括所有照片和评论）"""
+    from sqlmodel import select
+    
+    # 检查该群组中是否有用户的照片
+    photos = db.exec(
+        select(FoodPhoto).where(
+            FoodPhoto.group_id == group_id,
+            FoodPhoto.user_id == current_user.id
+        )
+    ).all()
+    
+    if not photos:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="群组不存在或无权删除",
+        )
+    
+    # 删除上传资产
+    upload_assets = db.exec(
+        select(UploadAsset).where(
+            UploadAsset.user_id == current_user.id,
+            UploadAsset.kind == "food-image",
+        )
+    ).all()
+    
+    # 匹配url进行删除
+    photo_urls = {photo.photo_url for photo in photos}
+    for asset in upload_assets:
+        if asset.public_url in photo_urls:
+            db.delete(asset)
+    
+    # 删除评论
+    comments = db.exec(
+        select(FoodPhotoComment).where(FoodPhotoComment.group_id == group_id)
+    ).all()
+    for comment in comments:
+        db.delete(comment)
+    
+    # 删除照片
+    for photo in photos:
+        db.delete(photo)
+    
+    db.commit()
+    
+    logger.info(
+        "food_group_deleted group_id=%s user_id=%s photos=%s comments=%s",
+        group_id,
+        current_user.id,
+        len(photos),
+        len(comments),
+    )
+    
+    return {"message": "群组已删除", "deleted_photos": len(photos), "deleted_comments": len(comments)}
 
 
 @router.post("/comments/clean-duplicates")
