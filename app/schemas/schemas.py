@@ -171,6 +171,18 @@ class DiaryGenerationResponse(BaseModel):
     updated: bool
 
 
+class DiaryGenerateRequest(BaseModel):
+    text: str | None = Field(default=None, max_length=5000)
+    image_urls: list[str] = Field(default_factory=list, max_length=9)
+    date: DateType
+
+
+class DiaryGenerateResponse(BaseModel):
+    content: str
+    title: str
+    date: DateType
+
+
 class ChatLogResponse(BaseModel):
     id: int
     user_id: int

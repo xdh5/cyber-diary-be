@@ -5,15 +5,13 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, SQLModel, select
 
 from app.api.chat import router as chat_router
-from app.api.chat import run_daily_chat_summary_job
+from app.api.diary import router as diary_router
 from app.api.v1.api import api_router
 from app.core.auth import get_password_hash, pick_default_avatar
 from app.core.config import settings
@@ -95,9 +93,8 @@ async def add_track_id_and_request_logging(request, call_next):
 # Include API router
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api", tags=["chat"])
+app.include_router(diary_router, prefix="/api", tags=["diary"])
 app.mount("/uploads", StaticFiles(directory=uploads_root), name="uploads")
-
-scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
 
 
 def ensure_database_schema(engine):
@@ -228,31 +225,6 @@ def read_root():
 @app.get("/health", response_model=dict)
 def health_check():
     return {"status": "ok"}
-
-
-@app.on_event("startup")
-def setup_scheduler():
-    if scheduler.running:
-        return
-
-    scheduler.add_job(
-        _run_daily_summary,
-        CronTrigger(hour=6, minute=0, timezone="Asia/Shanghai"),
-        id="daily-chat-summary",
-        replace_existing=True,
-    )
-    scheduler.start()
-
-
-@app.on_event("shutdown")
-def shutdown_scheduler():
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-
-
-def _run_daily_summary():
-    with Session(engine) as session:
-        run_daily_chat_summary_job(session)
 
 
 # Initialize database

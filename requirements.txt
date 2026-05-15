@@ -16,3 +16,4 @@ exifread==3.0.0
 bleach==6.2.0
 beautifulsoup4==4.12.3
 markdown-it-py==3.0.0
+requests==2.32.3

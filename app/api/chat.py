@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -6,12 +6,9 @@ from sqlmodel import Session
 
 from app.core.agent import run_chat_agent
 from app.core.auth import get_current_user
-from app.core.diary import generate_or_update_daily_diary
 from app.core.storage import save_user_upload
 from app.core.llm import LLMError
-from app.core.timezone import diary_today_shanghai
 from app.crud.crud import (
-    get_all_users,
     get_chat_logs_by_user_and_date,
     get_chat_logs_page_by_user,
     search_chat_logs_by_user,
@@ -25,7 +22,6 @@ from app.schemas.schemas import (
     ChatLogResponse,
     ChatRequest,
     ChatResponse,
-    DiaryGenerationResponse,
 )
 
 
@@ -260,58 +256,3 @@ def update_agent_settings(
         agent_name=(current_user.agent_name or "Agent").strip() or "Agent",
         agent_system_prompt=current_user.agent_system_prompt,
     )
-
-
-@router.post("/diary/summary", response_model=DiaryGenerationResponse)
-def generate_diary_summary(
-    day: str | None = Query(default=None, description="YYYY-MM-DD in Asia/Shanghai"),
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
-):
-    if day is None:
-        target_day = diary_today_shanghai()
-    else:
-        try:
-            target_day = date.fromisoformat(day)
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid date format")
-
-    logs = get_chat_logs_by_user_and_date(db, current_user.id, target_day)
-
-    try:
-        entry, updated, diary_text = generate_or_update_daily_diary(
-            db,
-            current_user.id,
-            target_day,
-            logs,
-            preserve_food_sections=False,
-        )
-    except LLMError:
-        logger.exception("Failed to generate diary summary for user_id=%s", current_user.id)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to generate diary summary",
-        )
-
-    return DiaryGenerationResponse(
-        answer=diary_text,
-        entry_id=entry.id,
-        date=target_day,
-        updated=updated,
-    )
-
-
-def run_daily_chat_summary_job(db: Session):
-    target_day = diary_today_shanghai() - timedelta(days=1)
-    users = get_all_users(db)
-
-    for user in users:
-        logs = get_chat_logs_by_user_and_date(db, user.id, target_day)
-        if not logs:
-            continue
-
-        try:
-            generate_or_update_daily_diary(db, user.id, target_day, logs, preserve_food_sections=False)
-        except LLMError:
-            logger.exception("Failed to generate diary summary for user_id=%s", user.id)
-            continue

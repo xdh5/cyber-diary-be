@@ -1,46 +1,18 @@
-import json
 import os
-import re
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import date as DateType
 from typing import Any
 
 import requests
 from sqlmodel import Session
 
-from app.core.diary import (
-    DIARY_RESPONSE_PREFIX,
-    build_recent_context,
-    build_diary_source_logs,
-    generate_or_update_daily_diary,
-)
 from app.core.llm import LLMError, _build_doubao_url
-from app.crud.crud import create_chat_log, get_chat_logs_by_user, get_chat_logs_by_user_and_date
+from app.crud.crud import create_chat_log, get_chat_logs_by_user
 from app.models.models import ChatLog
 from app.core.timezone import diary_today_shanghai
 
 
-SYSTEM_PROMPT = """你是 Cyber Diary 的聊天 agent。
-
-你有一个可用工具 generate_diary，用于把聊天整理或更新成日记。
-你需要根据用户最新输入和上下文自行判断：
-- 如果用户是在正常聊天，就直接自然回答，不调用工具。
-- 如果用户是在要求写日记/整理日记/更新日记，就调用 generate_diary。
-
-关键：用户可能会指定想要生成的日期（如"昨天"、"5月1日"、"上周一"、"两周前"等）。
-你要仔细理解用户说的日期，将其转换为 ISO 格式 (YYYY-MM-DD)，并通过 target_date 参数传给 generate_diary。
-- 如果用户没有明确指定日期，就不填 target_date，系统会默认用当天。
-- 如果用户说的是相对日期（如"昨天"），你要根据当前日期计算出具体的 ISO 日期。
-
-如果调用 generate_diary，直接把工具返回内容作为最终回复。
-"""
-
 CHAT_ONLY_SYSTEM_PROMPT = """你是 Cyber Diary 的聊天助手。
-用户当前是在正常聊天，不是在要求写日记。
-请直接自然回复，不要输出工具调用、JSON、代码块、action 字段或系统指令文本。
+请直接自然回复用户，不要输出工具调用、JSON、代码块、action 字段或系统指令文本。
 """
-
-AGENT_TIMEOUT_SECONDS = int(os.getenv("DOUBAO_AGENT_TIMEOUT_SECONDS", "45"))
 CONNECT_TIMEOUT_SECONDS = 5
 READ_TIMEOUT_SECONDS = int(os.getenv("DOUBAO_READ_TIMEOUT_SECONDS", "45"))
 
@@ -150,54 +122,6 @@ def _extract_message_content(content: Any) -> str:
     return ""
 
 
-def _parse_target_date(target_date_str: str) -> DateType | None:
-    """尝试解析ISO格式的日期字符串"""
-    if not target_date_str or not target_date_str.strip():
-        return None
-    try:
-        return DateType.fromisoformat(target_date_str.strip())
-    except (ValueError, AttributeError):
-        return None
-
-def _is_diary_intent(user_message: str) -> bool:
-    text = user_message.strip()
-    if not text:
-        return False
-
-    direct_patterns = [
-        r"(写|记|生成|整理|更新|汇总|总结).{0,8}日记",
-        r"(把|将).{0,12}(聊天|今天|这些).{0,8}(写|整理|汇总).{0,6}成日记",
-        r"日记.{0,6}(写|整理|更新|生成)",
-    ]
-    for pattern in direct_patterns:
-        if re.search(pattern, text):
-            return True
-
-    exact_commands = {
-        "写日记",
-        "日记",
-        "帮我写日记",
-        "整理日记",
-        "更新日记",
-        "生成日记",
-    }
-    return text in exact_commands
-
-
-def _generate_normal_reply(messages: list[dict[str, Any]]) -> str:
-    result = _call_doubao_chat(messages)
-    choices = result.get("choices") or []
-    if not choices:
-        raise LLMError("Empty agent response")
-
-    message_data = choices[0].get("message") or {}
-    answer = _extract_message_content(message_data.get("content", "")).strip()
-    if not answer:
-        raise LLMError("Empty agent response")
-
-    return answer
-
-
 def _generate_chat_only_reply(
     message: str,
     recent_context: str,
@@ -279,142 +203,22 @@ def run_chat_agent(
     )
 
     recent_logs = get_chat_logs_by_user(db, current_user_id, limit=30)
-    recent_context = build_recent_context(recent_logs)
+    recent_context_lines: list[str] = []
+    for log in recent_logs:
+        if log.role == "user":
+            recent_context_lines.append(f"我: {log.content}")
+        elif log.role == "assistant":
+            recent_context_lines.append(f"AI: {log.content}")
+    recent_context = "\n".join(recent_context_lines)
     target_day = diary_today_shanghai()
 
-    if not _is_diary_intent(message):
-        answer = _generate_chat_only_reply(
-            message,
-            recent_context,
-            target_day.isoformat(),
-            user_system_prompt=user_system_prompt,
-            image_urls=clean_image_urls,
-        )
-        create_chat_log(
-            db,
-            ChatLog(user_id=current_user_id, role="assistant", content=answer),
-        )
-        return answer
-
-    agent_input = (
-        f"当前日期: {target_day.isoformat()}\n\n"
-        f"最近聊天上下文:\n{recent_context or '无'}\n\n"
-        f"用户最新消息:\n{message}"
+    answer = _generate_chat_only_reply(
+        message,
+        recent_context,
+        target_day.isoformat(),
+        user_system_prompt=user_system_prompt,
+        image_urls=clean_image_urls,
     )
-
-    messages: list[dict[str, Any]] = []
-    custom_prompt = (user_system_prompt or "").strip()
-    if custom_prompt:
-        messages.append({"role": "system", "content": custom_prompt})
-    messages.extend(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": agent_input},
-        ]
-    )
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "generate_diary",
-                "description": "Generate or update diary from chat history. Can target a specific date or today.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user_request": {
-                            "type": "string",
-                            "description": "The user's original request that triggered diary generation.",
-                        },
-                        "target_date": {
-                            "type": "string",
-                            "description": "Target date in ISO format (YYYY-MM-DD). If user specified a relative date like '昨天', '5月1日', convert to ISO format. Default is today.",
-                        }
-                    },
-                    "required": ["user_request"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
-
-    try:
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(_call_doubao_chat, messages, tools)
-        try:
-            result = future.result(timeout=AGENT_TIMEOUT_SECONDS)
-        except FuturesTimeoutError as exc:
-            future.cancel()
-            raise LLMError(
-                f"Agent request timed out after {AGENT_TIMEOUT_SECONDS}s"
-            ) from exc
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
-
-        choices = result.get("choices") or []
-        if not choices:
-            raise LLMError("Empty agent response")
-
-        message_data = choices[0].get("message") or {}
-        tool_calls = message_data.get("tool_calls") or []
-        if tool_calls:
-            first_tool_call = tool_calls[0] or {}
-            function_data = first_tool_call.get("function") or {}
-            if function_data.get("name") != "generate_diary":
-                raise LLMError("Unsupported tool call")
-
-            raw_arguments = function_data.get("arguments") or "{}"
-            try:
-                parsed_arguments = json.loads(raw_arguments)
-            except Exception:
-                parsed_arguments = {}
-
-            user_request = parsed_arguments.get("user_request") or message
-            target_date_str = parsed_arguments.get("target_date") or ""
-            
-            # LLM 应该已经转换了日期，尝试解析它
-            target_day_value = _parse_target_date(target_date_str) or diary_today_shanghai()
-            
-            all_logs = get_chat_logs_by_user_and_date(db, current_user_id, target_day_value)
-            diary_logs = build_diary_source_logs(all_logs, trigger_message=user_request)
-
-            entry, updated, diary_text = generate_or_update_daily_diary(
-                db,
-                current_user_id,
-                target_day_value,
-                diary_logs,
-                preserve_food_sections=False,
-            )
-
-            answer = f"{DIARY_RESPONSE_PREFIX}{'，并更新到同一篇里了' if updated else '了'}。\n\n{diary_text}"
-            create_chat_log(
-                db,
-                ChatLog(user_id=current_user_id, role="assistant", content=answer),
-            )
-            return answer
-
-        # Diary intent but model didn't issue a proper tool call.
-        # Fallback to deterministic diary generation to avoid weird JSON/tool text.
-        # 直接用当天，AI应该已经理解了日期意图
-        target_day_value = diary_today_shanghai()
-        all_logs = get_chat_logs_by_user_and_date(db, current_user_id, target_day_value)
-        diary_logs = build_diary_source_logs(all_logs, trigger_message=message)
-        entry, updated, diary_text = generate_or_update_daily_diary(
-            db,
-            current_user_id,
-            target_day_value,
-            diary_logs,
-            preserve_food_sections=False,
-        )
-        answer = f"{DIARY_RESPONSE_PREFIX}{'，并更新到同一篇里了' if updated else '了'}。\n\n{diary_text}"
-    except LLMError:
-        raise
-    except Exception as exc:
-        raise LLMError(str(exc)) from exc
-
-    if not answer:
-        raise LLMError("Empty agent response")
-    
     create_chat_log(
         db,
         ChatLog(user_id=current_user_id, role="assistant", content=answer),
