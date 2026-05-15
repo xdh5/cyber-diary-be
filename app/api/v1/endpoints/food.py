@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date as DateType, datetime
 from io import BytesIO
 from typing import Optional
@@ -32,6 +32,9 @@ from app.schemas.schemas import FoodBatchProcessResponse, FoodPhotoDayResponse, 
 
 router = APIRouter()
 logger = logging.getLogger("cyber_diary.food")
+
+# 线程池：最多 3 个并发修图任务（防止内存爆炸）
+_enhancement_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="food-enhance-")
 
 
 def _extract_shot_at(payload: bytes) -> Optional[datetime]:
@@ -71,6 +74,11 @@ def _enhance_food_photo(payload: bytes) -> bytes:
     食品特化修图：CLAHE + 白平衡 + 色温矫正 + 饱和度增强 + 自适应锐化
     处理逆光、暗光、黄光、蓝光等常见食物拍照场景
     """
+    nparr = None
+    image = None
+    image_lab = None
+    image_hsv = None
+    gaussian = None
     try:
         # 解码图片
         nparr = np.frombuffer(payload, np.uint8)
@@ -85,12 +93,15 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         # clipLimit 从 2.5 提高到 3.8，更强的提亮效果
         clahe = cv2.createCLAHE(clipLimit=3.8, tileGridSize=(8, 8))
         l = clahe.apply(l)
+        del clahe  # 显式释放 CLAHE 对象
         
         # 在 LAB 空间直接增加 L 值 (+15)，确保整体不会太暗
         l = np.clip(l.astype(np.float32) + 15, 0, 255).astype(np.uint8)
         
         image_lab = cv2.merge([l, a, b])
         image = cv2.cvtColor(image_lab, cv2.COLOR_LAB2BGR)
+        del l, a, b, image_lab  # 释放 LAB 通道
+        image_lab = None
         
         # 2. 白平衡调整 (灰度世界假设) - 修正色温
         image_float = image.astype(np.float32) / 255.0
@@ -111,6 +122,7 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         image_float[:, :, 2] = np.clip(image_float[:, :, 2] * 1.06, 0, 1)  # R 通道提升 6%
         
         image = (image_float * 255).astype(np.uint8)
+        del image_float  # 释放浮点数组
         
         # 4. HSV 空间饱和度增强 - 食物看起来更诱人
         image_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -121,6 +133,8 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         
         image_hsv = cv2.merge([h, s, v]).astype(np.uint8)
         image = cv2.cvtColor(image_hsv, cv2.COLOR_HSV2BGR)
+        del h, s, v, image_hsv  # 释放 HSV 通道
+        image_hsv = None
         
         # 5. 自适应锐化 (Unsharp Mask) - 根据清晰度自动调整强度
         sharpness = _estimate_image_sharpness(image)
@@ -137,6 +151,8 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         gaussian = cv2.GaussianBlur(image, (0, 0), 0.8)
         image = cv2.addWeighted(image, 1.0 + strength, gaussian, -strength, 0)
         image = np.clip(image, 0, 255).astype(np.uint8)
+        del gaussian  # 释放高斯模糊结果
+        gaussian = None
         
         # 编码为 JPEG
         success, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -150,6 +166,9 @@ def _enhance_food_photo(payload: bytes) -> bytes:
         # 修图失败则返回原图，不影响上传
         logger.warning("food_photo_enhancement_failed error=%s", str(e)[:100])
         return payload
+    finally:
+        # 显式释放所有 NumPy 数组和 OpenCV 对象
+        del nparr, image, image_lab, image_hsv, gaussian
 
 
 def _enhance_and_replace_food_photo(
@@ -164,8 +183,10 @@ def _enhance_and_replace_food_photo(
     后台异步修图并替换 Cloudinary URL
     失败时保持原图，不影响用户
     """
+    db = None
     try:
         enhanced_payload = _enhance_food_photo(original_payload)
+        del original_payload  # 立即释放原始图片字节数据
 
         enhanced_url = _cloudinary_upload(
             enhanced_payload,
@@ -173,6 +194,7 @@ def _enhance_and_replace_food_photo(
             shot_at=shot_at,
             file_name=file_name,
         )
+        del enhanced_payload  # 释放增强后的图片字节数据
 
         # 使用独立会话更新数据库
         db = Session(engine)
@@ -189,6 +211,7 @@ def _enhance_and_replace_food_photo(
                 )
         finally:
             db.close()
+            db = None
 
     except Exception as e:
         logger.warning(
@@ -197,6 +220,13 @@ def _enhance_and_replace_food_photo(
             food_photo_id,
             str(e)[:100],
         )
+    finally:
+        # 确保数据库连接被关闭
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _schedule_food_photo_enhancement(
@@ -207,13 +237,16 @@ def _schedule_food_photo_enhancement(
     file_name: str,
     track_id: str,
 ):
-    """在线程中运行后台修图任务"""
-    thread = threading.Thread(
-        target=_enhance_and_replace_food_photo,
-        args=(food_photo_id, original_payload, user_id, shot_at, file_name, track_id),
-        daemon=True,
+    """在线程池中运行后台修图任务（限制并发数，防止内存爆炸）"""
+    _enhancement_executor.submit(
+        _enhance_and_replace_food_photo,
+        food_photo_id,
+        original_payload,
+        user_id,
+        shot_at,
+        file_name,
+        track_id,
     )
-    thread.start()
 
 
 def _cloudinary_upload(payload: bytes, *, user_id: int, shot_at: datetime, file_name: str) -> str:
@@ -250,7 +283,13 @@ def _validated_food_files(files: list[UploadFile]) -> tuple[list[tuple[UploadFil
     validated: list[tuple[UploadFile, bytes, str]] = []
     empty_files: list[str] = []
     for candidate in files:
-        payload = candidate.file.read() if candidate.file else b""
+        try:
+            payload = candidate.file.read() if candidate.file else b""
+        finally:
+            # 显式关闭文件句柄，防止文件描述符泄漏
+            if candidate.file:
+                candidate.file.close()
+        
         if not payload:
             empty_files.append(candidate.filename or "<unnamed>")
             continue
@@ -430,6 +469,9 @@ async def upload_food_photo(
             file_obj.filename or "food-image",
             track_id,
         )
+        
+        # 释放本地的 payload 引用（后台线程已经持有了它）
+        del payload
 
         logger.info(
             "food_upload_item_persisted track_id=%s user_id=%s index=%s filename=%s shot_date=%s",
