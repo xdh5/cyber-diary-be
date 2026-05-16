@@ -18,13 +18,25 @@ from app.schemas.schemas import CountdownCreate, CountdownResponse, CountdownUpd
 router = APIRouter()
 
 
+def _to_countdown_response(countdown: Countdown) -> dict:
+    return {
+        'id': countdown.id,
+        'name': countdown.name,
+        'target_date': countdown.target_date,
+        'emoji': countdown.emoji,
+        'created_at': countdown.created_at,
+        'updated_at': countdown.updated_at,
+    }
+
+
 @router.get("/", response_model=List[CountdownResponse])
 def list_countdowns(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     """Get all countdowns for the current user, sorted by target date."""
-    return get_countdowns_by_user(db, current_user.id)
+    countdowns = get_countdowns_by_user(db, current_user.id)
+    return [_to_countdown_response(c) for c in countdowns]
 
 
 @router.post("/", response_model=CountdownResponse, status_code=status.HTTP_201_CREATED)
@@ -38,8 +50,10 @@ def create_countdown_entry(
         user_id=current_user.id,
         name=countdown.name,
         target_date=countdown.target_date,
+        emoji=countdown.emoji,
     )
-    return create_countdown(db, new_countdown)
+    created = create_countdown(db, new_countdown)
+    return _to_countdown_response(created)
 
 
 @router.get("/{countdown_id}", response_model=CountdownResponse)
@@ -55,7 +69,7 @@ def get_countdown(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Countdown not found",
         )
-    return countdown
+    return _to_countdown_response(countdown)
 
 
 @router.patch("/{countdown_id}", response_model=CountdownResponse)
@@ -73,12 +87,12 @@ def update_countdown_entry(
             detail="Countdown not found",
         )
 
-    if countdown_data.name is not None:
-        countdown.name = countdown_data.name
-    if countdown_data.target_date is not None:
-        countdown.target_date = countdown_data.target_date
+    update_data = countdown_data.dict(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(countdown, field, value)
 
-    return update_countdown(db, countdown)
+    updated = update_countdown(db, countdown)
+    return _to_countdown_response(updated)
 
 
 @router.delete("/{countdown_id}", status_code=status.HTTP_204_NO_CONTENT)
