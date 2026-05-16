@@ -103,7 +103,8 @@ async def generate_diary_from_content(
                 }
             ]
 
-        from app.core.llm import _build_doubao_url, _doubao_api_key, _doubao_model
+        from app.core.llm import _build_doubao_url, _doubao_api_key
+        from app.core.agent import _doubao_model
         import requests
 
         api_key = _doubao_api_key()
