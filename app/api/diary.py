@@ -12,15 +12,29 @@ from app.schemas.schemas import DiaryGenerateRequest, DiaryGenerateResponse
 router = APIRouter()
 
 
-DIARY_GENERATION_PROMPT = """你将扮演我的数字分身。用户提供了图片和一些文字描述。
+DIARY_GENERATION_PROMPT_WITH_IMAGES = """你将扮演我的数字分身。用户提供了图片和一些文字描述。
 
 请根据以下内容，写一篇精简的中文日记。要求：
 1. 以第一人称"我"来写
 2. 包含用户描述的关键事件、感受
 3. 将图片自然地融入日记中合适的位置，使用 Markdown 图片格式：![描述](图片URL)
 4. 不要虚构细节，不要长篇扩写
-5. 篇幅适中，一般 150-300 字
+5. 改正错别字和病句，但不要改动用户的表达习惯
 6. 不要输出解释，只输出日记正文
+
+{user_content}
+
+日期：{target_date}
+"""
+
+DIARY_GENERATION_PROMPT_WITHOUT_IMAGES = """你将扮演我的数字分身。用户提供了文字描述。
+
+请根据以下内容，写一篇精简的中文日记。要求：
+1. 以第一人称"我"来写
+2. 包含用户描述的关键事件、感受
+3. 不要虚构细节，不要长篇扩写
+4. 篇幅适中，一般 150-300 字
+5. 不要输出解释，只输出日记正文
 
 {user_content}
 
@@ -61,8 +75,14 @@ async def generate_diary_from_content(
     if payload.text and payload.text.strip():
         user_content_parts.append(f"用户描述：\n{payload.text.strip()}")
 
-    if payload.image_urls:
-        image_count = len(payload.image_urls)
+    normalized_image_urls = [
+        url
+        for url in (_normalize_image_url(url, request) for url in (payload.image_urls or []))
+        if url
+    ]
+
+    if normalized_image_urls:
+        image_count = len(normalized_image_urls)
         user_content_parts.append(f"用户上传了 {image_count} 张图片，请根据图片内容补充日记。")
 
     if not user_content_parts:
@@ -73,14 +93,9 @@ async def generate_diary_from_content(
 
     user_content = "\n\n".join(user_content_parts)
 
-    normalized_image_urls = [
-        url
-        for url in (_normalize_image_url(url, request) for url in payload.image_urls)
-        if url
-    ]
-
     try:
-        prompt = DIARY_GENERATION_PROMPT.format(
+        prompt_template = DIARY_GENERATION_PROMPT_WITH_IMAGES if normalized_image_urls else DIARY_GENERATION_PROMPT_WITHOUT_IMAGES
+        prompt = prompt_template.format(
             user_content=user_content,
             target_date=payload.date.isoformat() if payload.date else "今天",
         )
@@ -183,8 +198,14 @@ async def generate_diary_stream(
     if payload.text and payload.text.strip():
         user_content_parts.append(f"用户描述：\n{payload.text.strip()}")
 
-    if payload.image_urls:
-        image_count = len(payload.image_urls)
+    normalized_image_urls = [
+        url
+        for url in (_normalize_image_url(url, request) for url in (payload.image_urls or []))
+        if url
+    ]
+
+    if normalized_image_urls:
+        image_count = len(normalized_image_urls)
         user_content_parts.append(f"用户上传了 {image_count} 张图片，请根据图片内容补充日记。")
 
     if not user_content_parts:
@@ -194,13 +215,8 @@ async def generate_diary_stream(
         )
 
     user_content = "\n\n".join(user_content_parts)
-    normalized_image_urls = [
-        url
-        for url in (_normalize_image_url(url, request) for url in payload.image_urls)
-        if url
-    ]
-
-    prompt = DIARY_GENERATION_PROMPT.format(
+    prompt_template = DIARY_GENERATION_PROMPT_WITH_IMAGES if normalized_image_urls else DIARY_GENERATION_PROMPT_WITHOUT_IMAGES
+    prompt = prompt_template.format(
         user_content=user_content,
         target_date=payload.date.isoformat() if payload.date else "今天",
     )

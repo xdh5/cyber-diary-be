@@ -13,6 +13,7 @@ from app.crud.crud import (
     create_entry,
     delete_entry,
     get_entries_by_user,
+    get_entries_by_user_and_date,
     get_entry_by_id_and_user,
     update_entry,
 )
@@ -136,6 +137,23 @@ def create_entry_endpoint(entry_in: EntryCreate, db: Session = Depends(get_db), 
     title = resolve_entry_title(normalized_content, entry_in.title)
     entry_data = entry_in.dict(exclude={'title'}, exclude_none=True)
     entry_data['content'] = normalized_content
+    
+    # Check if there's already an entry for the same date (excluding AI-generated ones)
+    entry_date = entry_data.get('date')
+    if entry_date:
+        existing_entries = get_entries_by_user_and_date(db, current_user.id, entry_date)
+        # Filter out AI-generated entries and get the latest user entry
+        user_entries = [e for e in existing_entries if e.mood != "AI汇总"]
+        if user_entries:
+            # Merge with the latest entry for the same date
+            latest_entry = user_entries[-1]  # Get the last one (most recent)
+            # Append new content to existing entry with a separator
+            latest_entry.content = latest_entry.content + "\n\n---\n\n" + normalized_content
+            latest_entry.title = title  # Update title to reflect the new content
+            entry = update_entry(db, latest_entry)
+            return _to_entry_response(entry)
+    
+    # No existing entry found, create a new one
     entry = Entry(**entry_data, title=title, user_id=current_user.id)
     entry = create_entry(db, entry)
     return _to_entry_response(entry)

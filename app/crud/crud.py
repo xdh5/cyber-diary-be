@@ -81,6 +81,16 @@ def get_entry_by_user_date_and_mood(db: Session, user_id: int, entry_date: date,
     ).first()
 
 
+def get_entries_by_user_and_date(db: Session, user_id: int, entry_date: date) -> List[Entry]:
+    """Get all entries for a specific user and date, ordered by creation time."""
+    return db.exec(
+        select(Entry).where(
+            Entry.user_id == user_id,
+            Entry.date == entry_date,
+        ).order_by(Entry.created_at.asc())
+    ).all()
+
+
 def create_entry(db: Session, entry: Entry) -> Entry:
     entry.content = normalize_entry_content(entry.content)
     entry.content_format = "html"
