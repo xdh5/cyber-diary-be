@@ -26,6 +26,7 @@ def _to_todo_response(todo: Todo) -> dict:
         'description': todo.description,
         'status': todo.status,
         'deadline': todo.deadline,
+        'group_id': todo.group_id,
         'completed_at': todo.completed_at,
         'created_at': todo.created_at,
         'updated_at': todo.updated_at,
@@ -54,6 +55,7 @@ def create_todo_entry(
         title=todo.title,
         description=todo.description,
         deadline=todo.deadline,
+        group_id=todo.group_id,
     )
     created = create_todo(db, new_todo)
     return _to_todo_response(created)

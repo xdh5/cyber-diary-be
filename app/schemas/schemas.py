@@ -219,11 +219,35 @@ class CountdownResponse(CountdownBase):
         from_attributes = True
 
 
+# Todo Group schemas
+class TodoGroupBase(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    is_default: Optional[bool] = False
+
+
+class TodoGroupCreate(TodoGroupBase):
+    pass
+
+
+class TodoGroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+
+
+class TodoGroupResponse(TodoGroupBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 # Todo schemas
 class TodoBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = Field(None, max_length=1000)
     deadline: Optional[DateType] = None
+    group_id: Optional[int] = None
 
 
 class TodoCreate(TodoBase):
@@ -235,6 +259,7 @@ class TodoUpdate(BaseModel):
     description: Optional[str] = Field(None, max_length=1000)
     status: Optional[str] = Field(None, pattern="^(pending|completed|discarded)$")
     deadline: Optional[DateType] = None
+    group_id: Optional[int] = None
 
 
 class TodoResponse(TodoBase):

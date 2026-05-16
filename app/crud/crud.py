@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 
 from app.core.content import extract_first_image_url, normalize_entry_content
 from app.core.timezone import diary_date_for_datetime, ensure_shanghai_tz, now_shanghai
-from app.models.models import ChatLog, Countdown, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, Todo, User
+from app.models.models import ChatLog, Countdown, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, Todo, TodoGroup, User
 
 
 # User CRUD
@@ -302,4 +302,45 @@ def update_todo(db: Session, todo: Todo) -> Todo:
 
 def delete_todo(db: Session, todo: Todo):
     db.delete(todo)
+    db.commit()
+
+
+# TodoGroup CRUD
+def get_todo_groups_by_user(db: Session, user_id: int) -> List[TodoGroup]:
+    return db.exec(
+        select(TodoGroup)
+        .where(TodoGroup.user_id == user_id)
+        .order_by(TodoGroup.is_default.desc(), TodoGroup.created_at.asc())
+    ).all()
+
+
+def get_todo_group_by_id_and_user(db: Session, group_id: int, user_id: int) -> Optional[TodoGroup]:
+    return db.exec(
+        select(TodoGroup).where(TodoGroup.id == group_id, TodoGroup.user_id == user_id)
+    ).first()
+
+
+def get_default_todo_group(db: Session, user_id: int) -> Optional[TodoGroup]:
+    return db.exec(
+        select(TodoGroup).where(TodoGroup.user_id == user_id, TodoGroup.is_default == True)
+    ).first()
+
+
+def create_todo_group(db: Session, group: TodoGroup) -> TodoGroup:
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+def update_todo_group(db: Session, group: TodoGroup) -> TodoGroup:
+    group.updated_at = now_shanghai()
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+def delete_todo_group(db: Session, group: TodoGroup):
+    db.delete(group)
     db.commit()

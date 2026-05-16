@@ -108,11 +108,23 @@ class Countdown(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=now_shanghai)
 
 
+class TodoGroup(SQLModel, table=True):
+    __tablename__ = "todo_groups"
+
+    id: Optional[int] = Field(default=None, primary_key=True, index=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    name: str = Field(max_length=100, index=True)
+    is_default: bool = Field(default=False, index=True)
+    created_at: datetime = Field(default_factory=now_shanghai)
+    updated_at: datetime = Field(default_factory=now_shanghai)
+
+
 class Todo(SQLModel, table=True):
     __tablename__ = "todos"
 
     id: Optional[int] = Field(default=None, primary_key=True, index=True)
     user_id: int = Field(foreign_key="users.id", index=True)
+    group_id: Optional[int] = Field(default=None, foreign_key="todo_groups.id", index=True)
     title: str = Field(max_length=255)
     description: Optional[str] = Field(default=None, max_length=1000)
     status: str = Field(default="pending", max_length=20, index=True)  # pending, completed, discarded
