@@ -106,3 +106,17 @@ class Countdown(SQLModel, table=True):
     emoji: str = Field(default="📅", max_length=10)
     created_at: datetime = Field(default_factory=now_shanghai)
     updated_at: datetime = Field(default_factory=now_shanghai)
+
+
+class Todo(SQLModel, table=True):
+    __tablename__ = "todos"
+
+    id: Optional[int] = Field(default=None, primary_key=True, index=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    title: str = Field(max_length=255)
+    description: Optional[str] = Field(default=None, max_length=1000)
+    status: str = Field(default="pending", max_length=20, index=True)  # pending, completed, discarded
+    deadline: Optional[DateType] = Field(default=None, index=True)
+    completed_at: Optional[datetime] = Field(default=None)
+    created_at: datetime = Field(default_factory=now_shanghai)
+    updated_at: datetime = Field(default_factory=now_shanghai)

@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 
 from app.core.content import extract_first_image_url, normalize_entry_content
 from app.core.timezone import diary_date_for_datetime, ensure_shanghai_tz, now_shanghai
-from app.models.models import ChatLog, Countdown, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, User
+from app.models.models import ChatLog, Countdown, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, Todo, User
 
 
 # User CRUD
@@ -267,4 +267,39 @@ def update_countdown(db: Session, countdown: Countdown) -> Countdown:
 
 def delete_countdown(db: Session, countdown: Countdown):
     db.delete(countdown)
+    db.commit()
+
+
+# Todo CRUD
+def get_todos_by_user(db: Session, user_id: int) -> List[Todo]:
+    return db.exec(
+        select(Todo)
+        .where(Todo.user_id == user_id)
+        .order_by(Todo.created_at.desc())
+    ).all()
+
+
+def get_todo_by_id_and_user(db: Session, todo_id: int, user_id: int) -> Optional[Todo]:
+    return db.exec(
+        select(Todo).where(Todo.id == todo_id, Todo.user_id == user_id)
+    ).first()
+
+
+def create_todo(db: Session, todo: Todo) -> Todo:
+    db.add(todo)
+    db.commit()
+    db.refresh(todo)
+    return todo
+
+
+def update_todo(db: Session, todo: Todo) -> Todo:
+    todo.updated_at = now_shanghai()
+    db.add(todo)
+    db.commit()
+    db.refresh(todo)
+    return todo
+
+
+def delete_todo(db: Session, todo: Todo):
+    db.delete(todo)
     db.commit()
