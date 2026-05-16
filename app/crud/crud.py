@@ -5,7 +5,7 @@ from sqlmodel import Session, select
 
 from app.core.content import extract_first_image_url, normalize_entry_content
 from app.core.timezone import diary_date_for_datetime, ensure_shanghai_tz, now_shanghai
-from app.models.models import ChatLog, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, User
+from app.models.models import ChatLog, Countdown, EmailVerificationCode, Entry, FoodPhoto, FoodPhotoComment, User
 
 
 # User CRUD
@@ -233,3 +233,38 @@ def create_food_photo_comment(db: Session, comment: FoodPhotoComment) -> FoodPho
     db.commit()
     db.refresh(comment)
     return comment
+
+
+# Countdown CRUD
+def get_countdowns_by_user(db: Session, user_id: int) -> List[Countdown]:
+    return db.exec(
+        select(Countdown)
+        .where(Countdown.user_id == user_id)
+        .order_by(Countdown.target_date.asc())
+    ).all()
+
+
+def get_countdown_by_id_and_user(db: Session, countdown_id: int, user_id: int) -> Optional[Countdown]:
+    return db.exec(
+        select(Countdown).where(Countdown.id == countdown_id, Countdown.user_id == user_id)
+    ).first()
+
+
+def create_countdown(db: Session, countdown: Countdown) -> Countdown:
+    db.add(countdown)
+    db.commit()
+    db.refresh(countdown)
+    return countdown
+
+
+def update_countdown(db: Session, countdown: Countdown) -> Countdown:
+    countdown.updated_at = now_shanghai()
+    db.add(countdown)
+    db.commit()
+    db.refresh(countdown)
+    return countdown
+
+
+def delete_countdown(db: Session, countdown: Countdown):
+    db.delete(countdown)
+    db.commit()

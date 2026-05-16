@@ -94,3 +94,15 @@ class UploadAsset(SQLModel, table=True):
     storage_path: str = Field(max_length=1024)
     public_url: str = Field(max_length=1024)
     created_at: datetime = Field(default_factory=now_shanghai, index=True)
+
+
+class Countdown(SQLModel, table=True):
+    __tablename__ = "countdowns"
+
+    id: Optional[int] = Field(default=None, primary_key=True, index=True)
+    user_id: int = Field(foreign_key="users.id", index=True)
+    name: str = Field(max_length=255)
+    target_date: DateType = Field(index=True)
+    emoji: str = Field(default="📅", max_length=10)
+    created_at: datetime = Field(default_factory=now_shanghai)
+    updated_at: datetime = Field(default_factory=now_shanghai)
