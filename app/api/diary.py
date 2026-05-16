@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlmodel import Session
+import json
 
 from app.core.auth import get_current_user
 from app.core.diary import generate_diary_title
@@ -114,7 +116,7 @@ async def generate_diary_from_content(
             _build_doubao_url("chat/completions"),
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"model": model, "messages": messages, "temperature": 0.3},
-            timeout=(5, 45),
+            timeout=(5, 120),  # 连接超时5秒，读超时120秒
         )
 
         if response.status_code >= 400:
@@ -161,3 +163,118 @@ async def generate_diary_from_content(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"生成日记失败: {str(exc)}",
         )
+
+
+@router.post("/diary/generate-stream")
+async def generate_diary_stream(
+    request: Request,
+    payload: DiaryGenerateRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """
+    流式生成日记内容。使用Server-Sent Events返回实时生成进度。
+    """
+    import requests
+    from app.core.llm import _build_doubao_url, _doubao_api_key
+    from app.core.agent import _doubao_model
+
+    user_content_parts = []
+    if payload.text and payload.text.strip():
+        user_content_parts.append(f"用户描述：\n{payload.text.strip()}")
+
+    if payload.image_urls:
+        image_count = len(payload.image_urls)
+        user_content_parts.append(f"用户上传了 {image_count} 张图片，请根据图片内容补充日记。")
+
+    if not user_content_parts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请提供文字描述或图片",
+        )
+
+    user_content = "\n\n".join(user_content_parts)
+    normalized_image_urls = [
+        url
+        for url in (_normalize_image_url(url, request) for url in payload.image_urls)
+        if url
+    ]
+
+    prompt = DIARY_GENERATION_PROMPT.format(
+        user_content=user_content,
+        target_date=payload.date.isoformat() if payload.date else "今天",
+    )
+
+    messages = [{"role": "user", "content": prompt}]
+    if normalized_image_urls:
+        image_content = [
+            {"type": "image_url", "image_url": {"url": url}}
+            for url in normalized_image_urls
+        ]
+        text_content = {"type": "text", "text": prompt}
+        messages = [
+            {
+                "role": "user",
+                "content": [*image_content, text_content],
+            }
+        ]
+
+    async def event_generator():
+        try:
+            api_key = _doubao_api_key()
+            model = _doubao_model()
+
+            # 发送初始事件
+            yield f"data: {json.dumps({'status': 'generating', 'message': '开始生成日记...', 'content': ''})}\n\n"
+
+            # 调用API流式请求
+            response = requests.post(
+                _build_doubao_url("chat/completions"),
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.3,
+                    "stream": True,
+                },
+                timeout=(5, 120),
+                stream=True,
+            )
+
+            if response.status_code >= 400:
+                yield f"data: {json.dumps({'status': 'error', 'message': f'API错误: {response.status_code}'})}\n\n"
+                return
+
+            full_content = ""
+            for line in response.iter_lines():
+                if not line:
+                    continue
+
+                line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+                if line_str.startswith("data: "):
+                    try:
+                        chunk_data = json.loads(line_str[6:])
+                        choices = chunk_data.get("choices", [])
+                        if choices:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                full_content += content
+                                # 实时推送生成的内容
+                                yield f"data: {json.dumps({'status': 'streaming', 'content': full_content, 'delta': content})}\n\n"
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+            if full_content.strip():
+                # 生成标题
+                title = generate_diary_title(full_content.strip(), payload.date)
+                yield f"data: {json.dumps({'status': 'complete', 'content': full_content.strip(), 'title': title, 'date': payload.date.isoformat() if payload.date else None})}\n\n"
+            else:
+                yield f"data: {json.dumps({'status': 'error', 'message': 'AI返回内容为空'})}\n\n"
+
+        except LLMError as e:
+            yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'status': 'error', 'message': f'生成失败: {str(e)}'})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

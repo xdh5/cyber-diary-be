@@ -12,4 +12,4 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "0", "--timeout-graceful-shutdown", "30"]
