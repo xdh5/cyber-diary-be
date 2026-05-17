@@ -135,7 +135,7 @@ def resolve_entry_title(content: str, title: str | None = None) -> str:
 def create_entry_endpoint(entry_in: EntryCreate, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     normalized_content = normalize_entry_content(entry_in.content)
     title = resolve_entry_title(normalized_content, entry_in.title)
-    entry_data = entry_in.dict(exclude={'title'}, exclude_none=True)
+    entry_data = entry_in.model_dump(exclude={'title'}, exclude_none=True)
     entry_data['content'] = normalized_content
     
     # Check if there's already an entry for the same date (excluding AI-generated ones)
@@ -165,7 +165,7 @@ def update_entry_endpoint(entry_id: int, entry_in: EntryUpdate, db: Session = De
     if entry is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Entry not found")
 
-    update_data = entry_in.dict(exclude_unset=True)
+    update_data = entry_in.model_dump(exclude_unset=True)
     if 'content' in update_data and update_data['content'] is not None:
         update_data['content'] = normalize_entry_content(update_data['content'])
 

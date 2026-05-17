@@ -87,7 +87,7 @@ def update_countdown_entry(
             detail="Countdown not found",
         )
 
-    update_data = countdown_data.dict(exclude_unset=True)
+    update_data = countdown_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(countdown, field, value)
 

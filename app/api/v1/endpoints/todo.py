@@ -104,7 +104,7 @@ def update_todo_group_entry(
             detail="Todo group not found",
         )
 
-    update_data = group_data.dict(exclude_unset=True)
+    update_data = group_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(group, field, value)
 
@@ -203,7 +203,7 @@ def update_todo_entry(
             detail="Todo not found",
         )
 
-    update_data = todo_data.dict(exclude_unset=True)
+    update_data = todo_data.model_dump(exclude_unset=True)
     
     # Handle group_id: 0 means default group (None in DB)
     if 'group_id' in update_data:
