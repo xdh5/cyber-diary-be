@@ -222,7 +222,6 @@ class CountdownResponse(CountdownBase):
 # Todo Group schemas
 class TodoGroupBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    is_default: Optional[bool] = False
 
 
 class TodoGroupCreate(TodoGroupBase):

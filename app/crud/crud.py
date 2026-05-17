@@ -310,19 +310,13 @@ def get_todo_groups_by_user(db: Session, user_id: int) -> List[TodoGroup]:
     return db.exec(
         select(TodoGroup)
         .where(TodoGroup.user_id == user_id)
-        .order_by(TodoGroup.is_default.desc(), TodoGroup.created_at.asc())
+        .order_by(TodoGroup.created_at.asc())
     ).all()
 
 
 def get_todo_group_by_id_and_user(db: Session, group_id: int, user_id: int) -> Optional[TodoGroup]:
     return db.exec(
         select(TodoGroup).where(TodoGroup.id == group_id, TodoGroup.user_id == user_id)
-    ).first()
-
-
-def get_default_todo_group(db: Session, user_id: int) -> Optional[TodoGroup]:
-    return db.exec(
-        select(TodoGroup).where(TodoGroup.user_id == user_id, TodoGroup.is_default == True)
     ).first()
 
 
