@@ -1,21 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date as DateType, datetime
-from io import BytesIO
 from typing import Optional
 from uuid import uuid4
 
-import cloudinary
-import cloudinary.uploader
-import exifread
+import httpx
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlmodel import Session
 
 from app.api.v1.endpoints.upload import ALLOWED_IMAGE_TYPES, MAX_IMAGE_SIZE
 from app.core.auth import get_current_user
 from app.core.config import settings
-from app.core.timezone import diary_date_for_datetime, now_shanghai
+from app.core.notion import create_diet_page, register_file_upload, send_file_upload
+from app.core.timezone import now_shanghai
 from app.crud.crud import (
     create_food_photo,
     get_food_photos_by_user,
@@ -29,88 +28,113 @@ from app.schemas.schemas import FoodBatchProcessResponse, FoodPhotoDayResponse, 
 
 router = APIRouter()
 logger = logging.getLogger("cyber_diary.food")
+ALLOWED_DIET_MEAL_TYPES = {"早餐", "午餐", "晚餐", "加餐"}
 
-# Image enhancement moved to client-side (browser). Server no longer performs OpenCV/Numpy processing.
-
-
-def _extract_shot_at(payload: bytes) -> Optional[datetime]:
+def _normalize_date_value(value: str) -> str:
     try:
-        tags = exifread.process_file(BytesIO(payload), details=False)
-        raw_value = tags.get("EXIF DateTimeOriginal") or tags.get("EXIF DateTimeDigitized") or tags.get("Image DateTime")
-        if not raw_value:
-            return None
-
-        raw_text = str(raw_value).strip()
-        if not raw_text:
-            return None
-
-        return datetime.strptime(raw_text, "%Y:%m:%d %H:%M:%S")
-    except Exception:
-        return None
-# Image enhancement moved to client-side; server no longer performs OpenCV/Numpy processing.
-
-
-def _cloudinary_upload(payload: bytes, *, user_id: int, shot_at: datetime, file_name: str) -> str:
-    if not settings.cloudinary_ready():
+        return DateType.fromisoformat(value).isoformat()
+    except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Cloudinary is not configured",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date must be in YYYY-MM-DD format",
+        ) from exc
+
+
+def _validate_diet_form(
+    *,
+    food_name: str,
+    calories: Optional[int],
+    meal_type: str,
+    date: str,
+    feeling: str,
+) -> tuple[str, Optional[int], str, str, str]:
+    food_name_text = food_name.strip()
+    if not food_name_text:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="food_name is required")
+
+    meal_type_text = meal_type.strip()
+    if meal_type_text not in ALLOWED_DIET_MEAL_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="meal_type must be one of 早餐/午餐/晚餐/加餐",
         )
 
-    cloudinary.config(
-        cloud_name=settings.CLOUDINARY_CLOUD_NAME,
-        api_key=settings.CLOUDINARY_API_KEY,
-        api_secret=settings.CLOUDINARY_API_SECRET,
-        secure=True,
-    )
-    result = cloudinary.uploader.upload(
-        payload,
-        folder=f"diary/{user_id}/{shot_at:%Y/%m/%d}",
-        public_id=uuid4().hex,
-        resource_type="image",
-        overwrite=False,
-    )
-    secure_url = result.get("secure_url")
-    if not secure_url:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Cloudinary response missing secure_url",
-        )
-    return secure_url
+    if calories is not None and calories <= 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="calories must be a positive integer")
+
+    return food_name_text, calories, meal_type_text, _normalize_date_value(date), feeling.strip()
 
 
-def _validated_food_files(files: list[UploadFile]) -> tuple[list[tuple[UploadFile, bytes, str]], list[str]]:
-
-    validated: list[tuple[UploadFile, bytes, str]] = []
-    empty_files: list[str] = []
-    for candidate in files:
-        try:
-            payload = candidate.file.read() if candidate.file else b""
-        finally:
-            # 显式关闭文件句柄，防止文件描述符泄漏
-            if candidate.file:
-                candidate.file.close()
-        
-        if not payload:
-            empty_files.append(candidate.filename or "<unnamed>")
-            continue
-
-        content_type = (candidate.content_type or "").lower()
+async def _upload_single_diet_image(
+    client: httpx.AsyncClient,
+    *,
+    file: UploadFile,
+    track_id: str,
+    index: int,
+    semaphore: asyncio.Semaphore,
+) -> str:
+    async with semaphore:
+        content_type = (file.content_type or "").lower()
         if content_type not in ALLOWED_IMAGE_TYPES:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Only jpg/png/webp/gif images are allowed",
             )
 
-        if len(payload) > MAX_IMAGE_SIZE:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Image size cannot exceed 5MB",
+        filename = file.filename or f"diet-image-{index}"
+        file_upload_id = await register_file_upload(
+            client,
+            filename=filename,
+            content_type=content_type,
+        )
+
+        try:
+            payload = await file.read()
+            if not payload:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Empty file: {filename}")
+
+            if len(payload) > MAX_IMAGE_SIZE:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Image size cannot exceed 5MB")
+
+            await send_file_upload(
+                client,
+                file_upload_id=file_upload_id,
+                filename=filename,
+                content_type=content_type,
+                payload=payload,
             )
 
-        validated.append((candidate, payload, content_type))
+            logger.info(
+                "food_diet_file_uploaded track_id=%s index=%s filename=%s file_upload_id=%s bytes=%s",
+                track_id,
+                index,
+                filename,
+                file_upload_id,
+                len(payload),
+            )
+            return file_upload_id
+        finally:
+            try:
+                await file.close()
+            except Exception:
+                pass
 
-    return validated, empty_files
+
+def _build_httpx_client() -> httpx.AsyncClient:
+    if not settings.notion_ready():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Notion is not configured",
+        )
+
+    timeout_seconds = max(int(settings.NOTION_TIMEOUT_SECONDS or 60), 10)
+    timeout = httpx.Timeout(timeout_seconds, connect=min(timeout_seconds, 15.0))
+    headers = {
+        "Authorization": f"Bearer {settings.NOTION_API_KEY}",
+        "Notion-Version": settings.NOTION_VERSION,
+        "Accept": "application/json",
+    }
+    return httpx.AsyncClient(base_url="https://api.notion.com/v1", timeout=timeout, headers=headers)
 
 
 @router.get("/photos", response_model=list[FoodPhotoDayResponse])
@@ -162,134 +186,84 @@ def list_food_photos(db: Session = Depends(get_db), current_user=Depends(get_cur
 
 @router.post("/photos", response_model=FoodBatchProcessResponse)
 async def upload_food_photo(
-    files: list[UploadFile] = File(default=[]),
-    caption: str | None = Form(default=None),
-    comment: str | None = Form(default=None),
-    shot_date: str | None = Form(default=None),
+    food_name: str = Form(...),
+    calories: Optional[int] = Form(default=None),
+    meal_type: str = Form(...),
+    date: str = Form(...),
+    feeling: str = Form(default=""),
+    images: list[UploadFile] = File(default=[]),
     x_track_id: str | None = Header(default=None, alias="X-Track-Id"),
     x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
-    db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
     track_id = (x_track_id or x_request_id or uuid4().hex).strip() or uuid4().hex
-    caption_text = (comment or caption or "").strip()
-    validated_files, empty_file_names = _validated_food_files(files)
-    file_sizes = [len(payload) for _file_obj, payload, _content_type in validated_files]
-
-    logger.info(
-        "food_upload_start track_id=%s user_id=%s files=%s non_empty_files=%s empty_files=%s caption_len=%s file_sizes=%s",
-        track_id,
-        current_user.id,
-        len(files),
-        len(validated_files),
-        len(empty_file_names),
-        len(caption_text),
-        file_sizes,
+    food_name_text, calories_value, meal_type_text, normalized_date, feeling_text = _validate_diet_form(
+        food_name=food_name,
+        calories=calories,
+        meal_type=meal_type,
+        date=date,
+        feeling=feeling,
     )
 
-    if empty_file_names:
-        logger.warning(
-            "food_upload_empty_files track_id=%s user_id=%s filenames=%s caption_len=%s",
-            track_id,
-            current_user.id,
-            empty_file_names,
-            len(caption_text),
-        )
+    logger.info(
+        "food_diet_upload_start track_id=%s user_id=%s food_name=%s meal_type=%s date=%s images=%s calories=%s feeling_len=%s",
+        track_id,
+        current_user.id,
+        food_name_text,
+        meal_type_text,
+        normalized_date,
+        len(images),
+        calories_value,
+        len(feeling_text),
+    )
 
-    if not validated_files:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files is required")
-
-    created_photos: list[FoodPhoto] = []
-    photo_group_id = track_id
-
-    # Parse shot_date parameter
-    parsed_shot_date: Optional[DateType] = None
-    if shot_date:
-        try:
-            parsed_shot_date = DateType.fromisoformat(shot_date)
-        except ValueError:
-            logger.warning("food_upload_invalid_shot_date track_id=%s user_id=%s shot_date=%s", track_id, current_user.id, shot_date)
-
-    for index, (file_obj, payload, content_type) in enumerate(validated_files, start=1):
-        item_track_id = f"{track_id}:{index}"
-        
-        # Extract shot time from EXIF
-        shot_at = _extract_shot_at(payload) or now_shanghai()
-        
-        # Determine shot_date: use parameter if provided, otherwise derive from shot_at
-        if parsed_shot_date:
-            # Replace date part with provided shot_date, keep time part from EXIF
-            shot_at = datetime.combine(parsed_shot_date, shot_at.time())
-            shot_date_val = parsed_shot_date
-        else:
-            shot_date_val = diary_date_for_datetime(shot_at)
-
-        # 先上传原始图到 Cloudinary（快速），立即返回给前端
-        cloudinary_url = _cloudinary_upload(
-            payload,
-            user_id=current_user.id,
-            shot_at=shot_at,
-            file_name=file_obj.filename or "food-image",
-        )
-
-        food_photo = create_food_photo(
-            db,
-            FoodPhoto(
-                user_id=current_user.id,
-                group_id=photo_group_id,
-                photo_url=cloudinary_url,
-                caption=caption_text or None,
-                shot_date=shot_date_val,
-                shot_at=shot_at,
-                created_at=now_shanghai(),
-                updated_at=now_shanghai(),
-            ),
-        )
-        created_photos.append(food_photo)
-
-        db.add(
-            UploadAsset(
-                user_id=current_user.id,
-                kind="food-image",
-                original_name=file_obj.filename or "food-image",
-                content_type=file_obj.content_type or "image/jpeg",
-                size_bytes=len(payload),
-                storage_path=cloudinary_url,
-                public_url=cloudinary_url,
-                created_at=now_shanghai(),
+    async with _build_httpx_client() as client:
+        semaphore = asyncio.Semaphore(4)
+        upload_tasks = [
+            _upload_single_diet_image(
+                client,
+                file=file,
+                track_id=track_id,
+                index=index,
+                semaphore=semaphore,
             )
-        )
-        db.commit()
+            for index, file in enumerate(images, start=1)
+        ]
 
-        # Image enhancement moved to client-side; server will not process images.
-        # 释放本地的 payload 引用
-        try:
-            del payload
-        except Exception:
-            pass
+        file_upload_ids: list[str] = []
+        if upload_tasks:
+            file_upload_ids = await asyncio.gather(*upload_tasks)
 
-        logger.info(
-            "food_upload_item_persisted track_id=%s user_id=%s index=%s filename=%s shot_date=%s",
-            item_track_id,
-            current_user.id,
-            index,
-            file_obj.filename or "<unnamed>",
-            shot_date_val.isoformat(),
+        page_result = await create_diet_page(
+            client,
+            food_name=food_name_text,
+            calories=calories_value,
+            meal_type=meal_type_text,
+            date=normalized_date,
+            feeling=feeling_text,
+            file_upload_ids=file_upload_ids,
         )
 
     logger.info(
-        "food_upload_completed track_id=%s user_id=%s photo_count=%s",
+        "food_diet_upload_completed track_id=%s user_id=%s file_upload_ids=%s page_id=%s",
         track_id,
         current_user.id,
-        len(created_photos),
+        len(file_upload_ids),
+        page_result.page_id,
     )
 
     return FoodBatchProcessResponse(
-        type="FOOD_PHOTO",
+        type="DIET_PAGE",
+        summary=f"已写入 Notion 页面，图片 {len(file_upload_ids)} 张",
+        food_name=food_name_text,
         track_id=track_id,
-        photos=created_photos,
-        processed_count=len(validated_files),
-        photo_count=len(created_photos),
+        page_id=page_result.page_id,
+        page_url=page_result.page_url,
+        file_upload_ids=file_upload_ids,
+        photos=[],
+        date=DateType.fromisoformat(normalized_date),
+        processed_count=len(file_upload_ids),
+        photo_count=len(file_upload_ids),
         info_count=0,
     )
 

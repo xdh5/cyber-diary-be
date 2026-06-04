@@ -37,6 +37,12 @@ class Settings:
     CLOUDINARY_API_KEY: Optional[str] = os.getenv("CLOUDINARY_API_KEY")
     CLOUDINARY_API_SECRET: Optional[str] = os.getenv("CLOUDINARY_API_SECRET")
 
+    # Notion
+    NOTION_API_KEY: Optional[str] = os.getenv("NOTION_API_KEY")
+    NOTION_DIET_DATABASE_ID: Optional[str] = os.getenv("NOTION_DIET_DATABASE_ID")
+    NOTION_VERSION: str = os.getenv("NOTION_VERSION", "2022-06-28")
+    NOTION_TIMEOUT_SECONDS: int = int(os.getenv("NOTION_TIMEOUT_SECONDS", "60"))
+
     # ByteDance Doubao
     DOUBAO_API_KEY: Optional[str] = os.getenv("DOUBAO_API_KEY")
 
@@ -73,6 +79,12 @@ class Settings:
             self.CLOUDINARY_CLOUD_NAME,
             self.CLOUDINARY_API_KEY,
             self.CLOUDINARY_API_SECRET,
+        ])
+
+    def notion_ready(self) -> bool:
+        return all([
+            self.NOTION_API_KEY,
+            self.NOTION_DIET_DATABASE_ID,
         ])
 
 settings = Settings()

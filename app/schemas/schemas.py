@@ -97,6 +97,9 @@ class FoodBatchProcessResponse(BaseModel):
     summary: Optional[str] = None
     food_name: Optional[str] = None
     track_id: Optional[str] = None
+    page_id: Optional[str] = None
+    page_url: Optional[str] = None
+    file_upload_ids: list[str] = Field(default_factory=list)
     photos: list[FoodPhotoResponse] = Field(default_factory=list)
     entry_id: Optional[int] = None
     date: Optional[DateType] = None
