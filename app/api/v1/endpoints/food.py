@@ -7,7 +7,7 @@ from typing import Optional
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, UploadFile, status
 from sqlmodel import Session
 
 from app.api.v1.endpoints.upload import ALLOWED_IMAGE_TYPES, MAX_IMAGE_SIZE
@@ -63,6 +63,60 @@ def _validate_diet_form(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="calories must be a positive integer")
 
     return food_name_text, calories, meal_type_text, _normalize_date_value(date), feeling.strip()
+
+
+def _coerce_optional_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="calories must be a positive integer")
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if not text.isdigit():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="calories must be a positive integer")
+        return int(text)
+
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="calories must be a positive integer")
+
+
+async def _parse_diet_upload_request(request: Request) -> tuple[str, Optional[int], str, str, str, list[UploadFile]]:
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "application/json" in content_type:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
+
+        return (
+            str(payload.get("food_name", "")),
+            _coerce_optional_int(payload.get("calories")),
+            str(payload.get("meal_type", "")),
+            str(payload.get("date", "")),
+            str(payload.get("feeling", "")),
+            [],
+        )
+
+    form = await request.form()
+    images: list[UploadFile] = []
+    for key, value in form.multi_items():
+        if key == "images" and isinstance(value, UploadFile):
+            images.append(value)
+
+    return (
+        str(form.get("food_name", "")),
+        _coerce_optional_int(form.get("calories")),
+        str(form.get("meal_type", "")),
+        str(form.get("date", "")),
+        str(form.get("feeling", "")),
+        images,
+    )
 
 
 async def _upload_single_diet_image(
@@ -186,17 +240,13 @@ def list_food_photos(db: Session = Depends(get_db), current_user=Depends(get_cur
 
 @router.post("/photos", response_model=FoodBatchProcessResponse)
 async def upload_food_photo(
-    food_name: str = Form(...),
-    calories: Optional[int] = Form(default=None),
-    meal_type: str = Form(...),
-    date: str = Form(...),
-    feeling: str = Form(default=""),
-    images: list[UploadFile] = File(default=[]),
+    request: Request,
     x_track_id: str | None = Header(default=None, alias="X-Track-Id"),
     x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
     current_user=Depends(get_current_user),
 ):
     track_id = (x_track_id or x_request_id or uuid4().hex).strip() or uuid4().hex
+    food_name, calories, meal_type, date, feeling, images = await _parse_diet_upload_request(request)
     food_name_text, calories_value, meal_type_text, normalized_date, feeling_text = _validate_diet_form(
         food_name=food_name,
         calories=calories,
