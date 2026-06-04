@@ -24,7 +24,17 @@ jobs:
           SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
           echo "=== 开始部署后端 ==="
-          
+
+          # Create a temporary .env on the runner populated from GitHub Secrets,
+          # then upload it to the server (scp -r * doesn't copy dotfiles).
+          cat > .deploy_env <<'ENV'
+NOTION_API_KEY=${{ secrets.NOTION_API_KEY }}
+NOTION_DIET_DATABASE_ID=${{ secrets.NOTION_DIET_DATABASE_ID }}
+ENV
+          chmod 600 .deploy_env
+
+          scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 .deploy_env ${SERVER_USER}@${SERVER_HOST}:/root/backend/.env
+
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 -r * ${SERVER_USER}@${SERVER_HOST}:/root/backend/
 
           ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 ${SERVER_USER}@${SERVER_HOST} << 'EOF'
@@ -45,4 +55,7 @@ jobs:
             docker ps --filter name=backend-server
           EOF
           
+          # cleanup temp env file
+          rm -f .deploy_env
+
           echo "=== 后端部署完成 ==="
