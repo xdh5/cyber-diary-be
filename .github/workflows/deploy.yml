@@ -27,14 +27,8 @@ jobs:
         run: |
           echo "=== 开始部署后端 ==="
 
-          # Create env file content
-          ENV_CONTENT=$(cat <<END
-NOTION_API_KEY=${NOTION_API_KEY}
-NOTION_DIET_DATABASE_ID=${NOTION_DIET_DATABASE_ID}
-END
-          )
-          
-          echo "$ENV_CONTENT" > .deploy_env
+          echo "NOTION_API_KEY=$NOTION_API_KEY" > .deploy_env
+          echo "NOTION_DIET_DATABASE_ID=$NOTION_DIET_DATABASE_ID" >> .deploy_env
           chmod 600 .deploy_env
 
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 .deploy_env ${SERVER_USER}@${SERVER_HOST}:/root/backend/.env
