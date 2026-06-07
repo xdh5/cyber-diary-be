@@ -26,33 +26,11 @@ jobs:
           NOTION_DIET_DATABASE_ID: ${{ secrets.NOTION_DIET_DATABASE_ID }}
         run: |
           echo "=== 开始部署后端 ==="
-
           echo "NOTION_API_KEY=$NOTION_API_KEY" > .deploy_env
           echo "NOTION_DIET_DATABASE_ID=$NOTION_DIET_DATABASE_ID" >> .deploy_env
           chmod 600 .deploy_env
-
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 .deploy_env ${SERVER_USER}@${SERVER_HOST}:/root/backend/.env
-
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 -r * ${SERVER_USER}@${SERVER_HOST}:/root/backend/
-
-          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 ${SERVER_USER}@${SERVER_HOST} << 'EOF'
-            set -e
-            cd /root/backend
-            mkdir -p /root/backend/data
-            docker build --progress=plain -t cyber-diary-backend .
-            if docker ps -a --format '{{.Names}}' | grep -q '^backend-server$'; then
-              docker stop backend-server
-              docker rm -f backend-server
-            fi
-            docker run -d --name backend-server --restart unless-stopped -p 8000:8000 \
-              -v /root/backend/data:/app/data \
-              --env-file /root/backend/.env \
-              cyber-diary-backend
-            sleep 3
-            curl -s http://localhost:8000/health || echo "服务可能尚未完全启动"
-            docker ps --filter name=backend-server
-EOF
-          
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 ${SERVER_USER}@${SERVER_HOST} 'set -e && cd /root/backend && mkdir -p /root/backend/data && docker build --progress=plain -t cyber-diary-backend . && if docker ps -a --format "{{.Names}}" | grep -q "^backend-server$"; then docker stop backend-server && docker rm -f backend-server; fi && docker run -d --name backend-server --restart unless-stopped -p 8000:8000 -v /root/backend/data:/app/data --env-file /root/backend/.env cyber-diary-backend && sleep 3 && curl -s http://localhost:8000/health || echo "服务可能尚未完全启动" && docker ps --filter name=backend-server'
           rm -f .deploy_env
-
           echo "=== 后端部署完成 ==="
