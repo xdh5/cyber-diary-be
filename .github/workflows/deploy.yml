@@ -27,9 +27,14 @@ jobs:
         run: |
           echo "=== 开始部署后端 ==="
 
-          # Create a temporary .env on the runner populated from the step env vars
-          # (avoid embedding ${{ }} expressions directly in a heredoc to prevent YAML syntax issues).
-          printf 'NOTION_API_KEY=%s\nNOTION_DIET_DATABASE_ID=%s\n' "$NOTION_API_KEY" "$NOTION_DIET_DATABASE_ID" > .deploy_env
+          # Create env file content
+          ENV_CONTENT=$(cat <<END
+NOTION_API_KEY=${NOTION_API_KEY}
+NOTION_DIET_DATABASE_ID=${NOTION_DIET_DATABASE_ID}
+END
+          )
+          
+          echo "$ENV_CONTENT" > .deploy_env
           chmod 600 .deploy_env
 
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 .deploy_env ${SERVER_USER}@${SERVER_HOST}:/root/backend/.env
@@ -52,9 +57,8 @@ jobs:
             sleep 3
             curl -s http://localhost:8000/health || echo "服务可能尚未完全启动"
             docker ps --filter name=backend-server
-          EOF
+EOF
           
-          # cleanup temp env file
           rm -f .deploy_env
 
           echo "=== 后端部署完成 ==="
