@@ -22,15 +22,14 @@ jobs:
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DIET_DATABASE_ID: ${{ secrets.NOTION_DIET_DATABASE_ID }}
         run: |
           echo "=== 开始部署后端 ==="
 
-          # Create a temporary .env on the runner populated from GitHub Secrets,
-          # then upload it to the server (scp -r * doesn't copy dotfiles).
-          cat > .deploy_env <<'ENV'
-NOTION_API_KEY=${{ secrets.NOTION_API_KEY }}
-NOTION_DIET_DATABASE_ID=${{ secrets.NOTION_DIET_DATABASE_ID }}
-ENV
+          # Create a temporary .env on the runner populated from the step env vars
+          # (avoid embedding ${{ }} expressions directly in a heredoc to prevent YAML syntax issues).
+          printf 'NOTION_API_KEY=%s\nNOTION_DIET_DATABASE_ID=%s\n' "$NOTION_API_KEY" "$NOTION_DIET_DATABASE_ID" > .deploy_env
           chmod 600 .deploy_env
 
           scp -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=120 .deploy_env ${SERVER_USER}@${SERVER_HOST}:/root/backend/.env
